@@ -1,0 +1,38 @@
+{
+  "name": "smartbuy-framework",
+  "version": "1.0.0",
+  "description": "高度抽象的多平台智能购买框架",
+  "main": "main.js",
+  "bin": {
+    "smartbuy": "./cli.js"
+  },
+  "scripts": {
+    "start": "node main.js",
+    "cli": "node cli.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "keywords": [
+    "抢购",
+    "多平台",
+    "自动化",
+    "购买框架",
+    "smartbuy"
+  ],
+  "author": "SmartBuy Team",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "crypto-js": "^4.2.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # 后端服务
+  smartbuy-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: smartbuy-manager-backend
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./storage:/app/storage
+      - ../SmartBuyFramework:/app/framework:ro  # 只读挂载现有框架
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_PATH=/app/storage/database/smartbuy.db
+      - FRAMEWORK_PATH=/app/framework
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - init-db
+
+  # 前端服务
+  smartbuy-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: smartbuy-manager-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - smartbuy-backend
+    restart: unless-stopped
+
+  # 数据库初始化服务
+  init-db:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: smartbuy-init-db
+    volumes:
+      - ./storage:/app/storage
+    environment:
+      - NODE_ENV=production
+      - DB_PATH=/app/storage/database/smartbuy.db
+    command: ["node", "backend/database/init.js"]
+    restart: "no"
+
+  # Nginx反向代理 (可选)
+  nginx:
+    image: nginx:alpine
+    container_name: smartbuy-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro  # SSL证书目录
+    depends_on:
+      - smartbuy-frontend
+      - smartbuy-backend
+    restart: unless-stopped
+
+volumes:
+  storage-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./storage
+
+networks:
+  default:
+    name: smartbuy-network

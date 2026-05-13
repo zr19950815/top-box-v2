@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+logs/
+*.log
+*.pid
+storage/
+SmartBuyManager/storage/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build outputs
+dist/
+build/
+coverage/
+SmartBuyManager/frontend/dist/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Archives and temporary files
+*.zip
+*.tar
+*.tar.gz
+*.tmp
+*.temp
