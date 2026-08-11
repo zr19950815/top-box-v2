@@ -27,7 +27,9 @@ const config = {
   framework: {
     path: process.env.FRAMEWORK_PATH || path.resolve(__dirname, '../../../SmartBuyFramework'),
     cliScript: 'cli.js',
-    timeout: 300000, // 5分钟超时
+    // 0 disables the executor timeout. Purchase monitoring tasks are expected
+    // to remain alive until they complete or are stopped explicitly.
+    timeout: Number(process.env.TASK_TIMEOUT_MS || 0),
     maxConcurrentTasks: process.env.MAX_CONCURRENT_TASKS || 10
   },
 
@@ -50,7 +52,7 @@ const config = {
   // 任务配置
   tasks: {
     maxConcurrent: 10,        // 最大并发任务数
-    defaultTimeout: 300000,   // 默认任务超时时间(5分钟)
+    defaultTimeout: Number(process.env.TASK_TIMEOUT_MS || 0),
     retryAttempts: 3,         // 失败重试次数
     cleanupInterval: 3600000, // 清理间隔(1小时)
     maxHistoryDays: 30        // 任务历史保留天数

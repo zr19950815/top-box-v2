@@ -116,7 +116,7 @@ class TaskManager extends EventEmitter {
       console.log(`🚀 启动任务: ${taskId} (${task.platform} ${task.mode}模式)`);
 
       // 异步执行任务
-      this.taskExecutor.executeTask(taskId, task.commandString)
+      this.taskExecutor.executeTask(taskId, task.command_string)
         .catch(error => {
           console.error(`❌ 任务执行失败: ${taskId}`, error);
           this.handleTaskError(taskId, error);
@@ -456,60 +456,48 @@ class TaskManager extends EventEmitter {
    * @private
    */
   parseCommandString(commandString) {
-    // 这里复用现有框架的CommandParser逻辑
-    // 简化版解析，实际应该调用SmartBuyFramework的CommandParser
-    
-    const parts = commandString.split('-');
-    if (parts.length < 4) {
+    // Use the framework parser as the single source of truth so Manager stays
+    // aligned with every registered platform and token/password command form.
+    const CommandParser = require(`${config.framework.path}/core/CommandParser`);
+    const parts = CommandParser.smartSplit(commandString);
+    if (parts.length < 2) {
       throw new Error('命令格式错误');
     }
 
-    const platformAndMode = parts[0];
-    const account = parts[1];
-    const auth = parts[2]; // token或密码
-    const payPassword = parts[3];
-    const productInfo = parts[4] || '';
+    const command = CommandParser.parseCommand(parts[0]);
+    const params = parts.slice(1);
+    const baseParams = CommandParser.parseBaseParams(params);
+    let taskParams = { ...baseParams };
 
-    // 解析平台和模式
-    let platform, mode, taskType = 'smart-buy';
-    
-    if (platformAndMode.startsWith('ky')) {
-      platform = 'kyart';
-      if (platformAndMode.includes('列表')) {
-        mode = 'list';
-      } else if (platformAndMode.includes('快捷')) {
-        mode = 'quick';
-      } else if (platformAndMode.includes('批量')) {
-        mode = 'batch';
-      } else if (platformAndMode.includes('合成')) {
-        mode = null;
-        taskType = 'combination';
+    if (command.task === 'smart-buy') {
+      const productSpecIndex = baseParams.authMode === 'token'
+        ? (baseParams.account ? 3 : 2)
+        : 3;
+      const productParts = String(params[productSpecIndex] || '').split('*');
+      if (productParts.length !== 3) {
+        throw new Error('商品参数格式应为 商品名称或ID*数量*最高价格');
       }
-    } else if (platformAndMode.startsWith('hz')) {
-      platform = 'hzmiss';
-      // 类似解析...
-    }
-
-    // 解析商品信息
-    let productId, quantity, maxPrice;
-    if (productInfo.includes('*')) {
-      const productParts = productInfo.split('*');
-      productId = productParts[0];
-      quantity = parseInt(productParts[1]) || 1;
-      maxPrice = parseFloat(productParts[2]) || 0;
+      const quantity = Number.parseInt(productParts[1], 10);
+      const maxPrice = Number.parseFloat(productParts[2]);
+      if (!productParts[0] || !Number.isInteger(quantity) || quantity <= 0 || maxPrice <= 0) {
+        throw new Error('商品名称、数量或最高价格无效');
+      }
+      taskParams = {
+        ...baseParams,
+        productId: productParts[0],
+        quantity,
+        maxPrice,
+      };
     }
 
     return {
-      platform,
-      mode,
-      taskType,
+      platform: command.platform,
+      mode: command.mode || null,
+      taskType: command.task,
       config: {
-        account,
-        auth,
-        payPassword,
-        productId,
-        quantity,
-        maxPrice
+        ...taskParams,
+        // Keep the old Manager field for callers that still display `auth`.
+        auth: taskParams.token || taskParams.password,
       }
     };
   }

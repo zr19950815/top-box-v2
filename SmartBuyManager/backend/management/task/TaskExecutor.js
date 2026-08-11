@@ -41,10 +41,13 @@ class TaskExecutor extends EventEmitter {
       // 保存进程引用
       this.runningProcesses.set(taskId, child);
 
-      // 设置超时
-      const timeoutId = setTimeout(() => {
-        this.killTask(taskId, '任务执行超时');
-      }, this.timeout);
+      // Long-running purchase monitors have no timeout by default. A positive
+      // TASK_TIMEOUT_MS can still be supplied when a deployment needs one.
+      const timeoutId = this.timeout > 0
+        ? setTimeout(() => {
+            this.killTask(taskId, '任务执行超时');
+          }, this.timeout)
+        : null;
 
       // 监听标准输出
       child.stdout.on('data', (data) => {

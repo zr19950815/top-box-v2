@@ -161,7 +161,12 @@ class IntervalConfigManager {
       console.log(`⏱️  ${platform}:`);
       console.log(`   基础: 列表${config.base.list}ms, 快捷${config.base.quick}ms, 批量${config.base.batch}ms`);
       console.log(`   限制: ${config.limits.minInterval}-${config.limits.maxInterval}ms`);
-      console.log(`   API: ${config.limits.apiCallsPerMinute}次/分`);
+      const rateLimit = config.limits.apiCallsPerMinute;
+      console.log(
+        rateLimit
+          ? `   API: ${rateLimit}次/分`
+          : '   API: 未配置已验证的官方限制'
+      );
     }
     console.log('========================\n');
   }

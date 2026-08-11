@@ -36,6 +36,16 @@ class HcAdapter extends PlatformAdapter {
     this.isLoggedIn = Boolean(this.token);
     this.userInfo = null;
     this.lastOrderContext = null;
+    this.useBrowserTransport = config.useBrowserTransport !== false;
+    this.browserTransport = null;
+    this.intervalJitterRatio = Number(config.intervalJitterRatio ?? 1 / 3);
+    this.edgeOneCooldownSchedule = (
+      config.edgeOneCooldownSchedule || [5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000]
+    ).map(Number).filter((value) => Number.isFinite(value) && value >= 0);
+    this.edgeOneBlockCount = 0;
+    this.edgeOneBlockedUntil = 0;
+    this.sleep = config.sleep || ((milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.productConfigPath =
       config.productConfigPath ||
       path.resolve(__dirname, '../../config/products/hc.js');
@@ -47,6 +57,78 @@ class HcAdapter extends PlatformAdapter {
       }),
       validateStatus: () => true,
     });
+  }
+
+  async getBrowserTransport() {
+    if (this.browserTransport) {
+      return this.browserTransport;
+    }
+
+    const { Impit } = await import('impit');
+    const proxyUrl =
+      this.options.proxyUrl ||
+      process.env.HTTPS_PROXY ||
+      process.env.HTTP_PROXY ||
+      process.env.ALL_PROXY;
+
+    this.browserTransport = new Impit({
+      browser: this.options.browserProfile || 'chrome',
+      ignoreTlsErrors: true,
+      ...(proxyUrl ? { proxyUrl } : {}),
+    });
+    return this.browserTransport;
+  }
+
+  async sendHttpRequest(method, url, payload, headers, timeout) {
+    if (!this.useBrowserTransport) {
+      const requestConfig = {
+        method,
+        url,
+        headers,
+        timeout,
+        validateStatus: () => true,
+      };
+      if (method === 'get') {
+        requestConfig.params = payload;
+      } else {
+        requestConfig.data = payload;
+      }
+      return this.http.request(requestConfig);
+    }
+
+    const transport = await this.getBrowserTransport();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout || 10000);
+
+    try {
+      const requestURL = new URL(url);
+      const options = {
+        method: method.toUpperCase(),
+        headers,
+        signal: controller.signal,
+      };
+
+      if (method === 'get') {
+        Object.entries(payload || {}).forEach(([key, value]) => {
+          requestURL.searchParams.append(key, String(value));
+        });
+      } else {
+        options.body = JSON.stringify(payload || {});
+      }
+
+      const response = await transport.fetch(requestURL.toString(), options);
+      const responseText = await response.text();
+      let responseData = responseText;
+      try {
+        responseData = responseText ? JSON.parse(responseText) : null;
+      } catch (error) {
+        // Keep non-JSON responses for the standard HTTP error handling below.
+      }
+
+      return { status: response.status, data: responseData };
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   getPlatformName() {
@@ -61,12 +143,17 @@ class HcAdapter extends PlatformAdapter {
     const headers = {
       'User-Agent':
         'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
       Token: this.token || 'null',
       'Content-Type': 'application/json; charset=utf-8',
       signature: '2bd17b71495819c32b37b39388bcb2ac',
       referer: `${this.h5URL}/`,
       platformn: 'h5',
       Origin: this.h5URL,
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-site',
       ...extraHeaders,
     };
 
@@ -85,12 +172,59 @@ class HcAdapter extends PlatformAdapter {
   }
 
   getXToken(url, payload = {}) {
+    // NewBee's H5 client canonicalizes request fields before signing them.
+    // Keeping insertion order happens to work for the default market payload,
+    // but fails as soon as a field such as `keywords` is appended later.
     const params = Object.keys(payload || {})
+      .filter((key) => payload[key] !== undefined && payload[key] !== null && payload[key] !== '')
+      .sort()
       .map((key) => `${key}=${payload[key]}`)
       .join('&');
     const signSource =
       `${this.getSignPath(url)}?${params}&key=${this.signatureKey}`.toLocaleLowerCase();
     return cryptJs.MD5(signSource).toString();
+  }
+
+  isEdgeOneBlock(response) {
+    if (response?.status !== 405 || typeof response.data !== 'string') {
+      return false;
+    }
+
+    return /EdgeOne|请求已被站点的安全策略拦截|Access Restricted/i.test(
+      response.data
+    );
+  }
+
+  registerEdgeOneBlock() {
+    const schedule = this.edgeOneCooldownSchedule.length > 0
+      ? this.edgeOneCooldownSchedule
+      : [5 * 60 * 1000];
+    const cooldownMs = schedule[Math.min(this.edgeOneBlockCount, schedule.length - 1)];
+    this.edgeOneBlockCount += 1;
+    this.edgeOneBlockedUntil = Date.now() + cooldownMs;
+
+    Logger.warn(
+      `[HC] EdgeOne 安全拦截，暂停请求 ${Math.ceil(cooldownMs / 60000)} 分钟`
+    );
+
+    return cooldownMs;
+  }
+
+  async waitForEdgeOneCooldown() {
+    const remainingMs = this.edgeOneBlockedUntil - Date.now();
+    if (remainingMs <= 0) {
+      return;
+    }
+
+    Logger.warn(
+      `[HC] EdgeOne 熔断中，${Math.ceil(remainingMs / 1000)} 秒后恢复请求`
+    );
+    await this.sleep(remainingMs);
+  }
+
+  resetEdgeOneCircuit() {
+    this.edgeOneBlockCount = 0;
+    this.edgeOneBlockedUntil = 0;
   }
 
   async request(method, url, data = {}, options = {}) {
@@ -101,21 +235,29 @@ class HcAdapter extends PlatformAdapter {
       'x-token': this.getXToken(url, payload),
     };
 
-    const requestConfig = {
-      method: normalizedMethod,
-      url,
-      headers,
-      timeout: options.timeout || undefined,
-    };
-
-    if (normalizedMethod === 'get') {
-      requestConfig.params = payload;
-    } else {
-      requestConfig.data = payload;
-    }
-
     try {
-      const response = await this.http.request(requestConfig);
+      await this.waitForEdgeOneCooldown();
+
+      const response = await this.sendHttpRequest(
+        normalizedMethod,
+        url,
+        payload,
+        headers,
+        options.timeout || this.options.timeout || 10000
+      );
+
+      if (this.isEdgeOneBlock(response)) {
+        const cooldownMs = this.registerEdgeOneBlock();
+        throw ErrorFactory.createApiError(
+          `EdgeOne 安全拦截，已暂停请求 ${Math.ceil(cooldownMs / 60000)} 分钟`,
+          405,
+          { edgeOneBlocked: true, cooldownMs }
+        );
+      }
+
+      if (response.status < 400 && this.edgeOneBlockCount > 0) {
+        this.resetEdgeOneCircuit();
+      }
 
       if (response.status === 504) {
         return { code: -1, data: { code: -1 }, msg: 'Gateway Timeout' };
@@ -219,17 +361,6 @@ class HcAdapter extends PlatformAdapter {
   }
 
   async getCaptchaResult() {
-    const captchaData = await this.request('get', `${this.apiBaseURL}/api/sms/getCode`, {
-      timestamp: Date.now(),
-    });
-    this.ensureSuccess(captchaData, '获取验证码失败', ErrorTypes.LOGIN_FAILED);
-
-    const imageBase64 = captchaData.data?.base64;
-    const captchaId = captchaData.data?.id;
-    if (!imageBase64 || !captchaId) {
-      throw ErrorFactory.createAuthError('验证码接口返回不完整');
-    }
-
     const username =
       this.options.ttshituUsername || process.env.TTSHITU_USERNAME || 'zrrrrr';
     const password =
@@ -241,28 +372,56 @@ class HcAdapter extends PlatformAdapter {
       );
     }
 
-    const base64Prefix = 'data:image/png;base64,';
-    const response = await axios.post(
-      this.options.ttshituURL || 'http://api.ttshitu.com/predict',
-      {
-        username,
-        password,
-        image: imageBase64.replace(base64Prefix, ''),
-        typeid: this.options.ttshituTypeId || 3,
-      },
-      { timeout: this.options.captchaTimeout || 15000 }
-    );
+    const maxAttempts = Number(this.options.captchaMaxAttempts || 5);
+    let lastError = null;
 
-    if (!response.data?.success || !response.data?.data?.result) {
-      throw ErrorFactory.createAuthError(
-        response.data?.message || response.data?.msg || '验证码识别失败'
-      );
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Fetch a fresh captcha for every attempt. Reusing an old captcha ID can
+        // make a later recognition result invalid even when its text is correct.
+        const captchaData = await this.request(
+          'get',
+          `${this.apiBaseURL}/api/sms/getCode`,
+          { timestamp: Date.now() }
+        );
+        this.ensureSuccess(captchaData, '获取验证码失败', ErrorTypes.LOGIN_FAILED);
+
+        const imageBase64 = captchaData.data?.base64;
+        const captchaId = captchaData.data?.id;
+        if (!imageBase64 || !captchaId) {
+          throw new Error('验证码接口返回不完整');
+        }
+
+        const response = await axios.post(
+          this.options.ttshituURL || 'http://api.ttshitu.com/predict',
+          {
+            username,
+            password,
+            image: imageBase64.replace(/^data:image\/\w+;base64,/, ''),
+            typeid: this.options.ttshituTypeId || 3,
+          },
+          { timeout: this.options.captchaTimeout || 15000 }
+        );
+        const result = response.data?.data?.result;
+        if (!response.data?.success || !result) {
+          throw new Error(
+            response.data?.message || response.data?.msg || '验证码识别失败'
+          );
+        }
+
+        Logger.info(`[HC] 验证码识别成功 (${attempt}/${maxAttempts})`);
+        return { captcha: result, id: captchaId };
+      } catch (error) {
+        lastError = error;
+        Logger.warn(
+          `[HC] 验证码识别失败 (${attempt}/${maxAttempts}): ${error.message}`
+        );
+      }
     }
 
-    return {
-      captcha: response.data.data.result,
-      id: captchaId,
-    };
+    throw ErrorFactory.createAuthError(
+      `验证码识别连续失败 ${maxAttempts} 次: ${lastError?.message || '未知错误'}`
+    );
   }
 
   async refreshToken() {
@@ -308,10 +467,16 @@ class HcAdapter extends PlatformAdapter {
       productId,
       options.productConfig
     );
+    // The current NewBee endpoint rejects values above 20 even though the
+    // shared list strategy asks adapters for 50 items by default.
+    const pageSize = Math.min(
+      20,
+      Math.max(1, Number(options.pageSize || 20))
+    );
     const data = await this.request('get', `${this.apiBaseURL}/api/v2/market/productList`, {
       order: 'price',
       page: options.page || 1,
-      per_page: options.pageSize || 20,
+      per_page: pageSize,
       product_id: resolvedProductId,
       sort: String(options.order || 'asc').toUpperCase(),
       timestamp: Date.now(),
@@ -497,25 +662,30 @@ class HcAdapter extends PlatformAdapter {
     const seenIds = new Set();
     const maxPages = Number(this.options.catalogMaxPages || 20);
 
-    for (let page = 1; page <= maxPages; page++) {
-      const data = await this.fetchCatalogPage(page, keyword);
-      const rows = this.extractRows(data?.data);
+    // The current HC market separates products by numeric product_type.
+    // Query every supported market type because names may exist in either tab.
+    for (const productType of this.getCatalogProductTypes()) {
+      for (let page = 1; page <= maxPages; page++) {
+        const data = await this.fetchCatalogPage(page, keyword, productType);
+        this.ensureSuccess(data, '获取 HC 藏品目录失败');
+        const rows = this.extractRows(data?.data);
 
-      rows.forEach((item) => {
-        const product = this.normalizeCatalogProduct(item);
-        if (!product || seenIds.has(product.id)) {
-          return;
+        rows.forEach((item) => {
+          const product = this.normalizeCatalogProduct(item);
+          if (!product || seenIds.has(product.id)) {
+            return;
+          }
+          seenIds.add(product.id);
+          discoveredConfig[product.name] = {
+            id: product.id,
+            price: product.price,
+          };
+        });
+
+        const hasMore = Boolean(data?.data?.has_more);
+        if (!hasMore || rows.length === 0) {
+          break;
         }
-        seenIds.add(product.id);
-        discoveredConfig[product.name] = {
-          id: product.id,
-          price: product.price,
-        };
-      });
-
-      const hasMore = Boolean(data?.data?.has_more);
-      if (!hasMore || rows.length === 0) {
-        break;
       }
     }
 
@@ -534,23 +704,34 @@ class HcAdapter extends PlatformAdapter {
     return mergedConfig;
   }
 
-  async fetchCatalogPage(page, keyword = '') {
+  getCatalogProductTypes() {
+    const configuredTypes = this.options.catalogProductTypes || [19, 25];
+    const values = Array.isArray(configuredTypes)
+      ? configuredTypes
+      : String(configuredTypes).split(',');
+
+    return [...new Set(values.map(Number).filter(Number.isFinite))];
+  }
+
+  async fetchCatalogPage(page, keyword = '', productType = null) {
+    const resolvedProductType =
+      productType === null ? this.getCatalogProductTypes()[0] : Number(productType);
     const payload = {
       hasmarket: -1,
       hot: 0,
-      collection_id: '',
-      album_id: '',
-      product_id: '',
       market_type: 0,
-      keywords: keyword,
-      product_type: 'virtual',
-      page,
-      time_type: '',
-      per_page: Number(this.options.catalogPageSize || 50),
       order: 'weigh',
+      page: Number(page),
+      per_page: Number(this.options.catalogPageSize || 20),
+      product_type: resolvedProductType,
       sort: 'DESC',
+      time_type: Number(this.options.catalogTimeType || 1),
       timestamp: Date.now(),
     };
+
+    if (keyword) {
+      payload.keywords = keyword;
+    }
 
     return this.request('get', `${this.apiBaseURL}/api/v2/market/search`, payload);
   }
@@ -838,14 +1019,12 @@ class HcAdapter extends PlatformAdapter {
   }
 
   async executeHFRequest(endpoint, data, uuid, refererUrl) {
-    const response = await axios.post(
+    const response = await this.sendHttpRequest(
+      'post',
       `https://hfpay.cloudpnr.com/api/hfpwalleth5/${endpoint}`,
       data,
-      {
-        headers: this.getHFHeader(data, uuid, refererUrl),
-        timeout: 10000,
-        validateStatus: () => true,
-      }
+      this.getHFHeader(data, uuid, refererUrl),
+      10000
     );
 
     if (!response.data || response.data.resp_code !== 'C00000') {

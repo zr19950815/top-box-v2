@@ -25,7 +25,8 @@ module.exports = {
   limits: {
     minInterval: 180,
     maxInterval: 10000,
-    apiCallsPerMinute: 120,
+    // No verified official NewBee/HC rate limit is currently known.
+    apiCallsPerMinute: null,
     burstLimit: 10,
   },
 };

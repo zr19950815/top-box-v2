@@ -62,7 +62,9 @@ class PurchaseStrategy {
         }
         
         // 控制执行间隔 - 使用平台配置的间隔
-        const platformInterval = this.getPlatformInterval(config);
+        const platformInterval = this.applyIntervalJitter(
+          this.getPlatformInterval(config)
+        );
         await this.controlInterval(cycleStartTime, platformInterval);
       }
       
@@ -189,6 +191,21 @@ class PurchaseStrategy {
     if (waitTime > 0) {
       await this.delay(waitTime);
     }
+  }
+
+  /**
+   * Apply adapter-specific random jitter while preserving the configured
+   * average interval. HC uses 1/3, so a 300ms target becomes roughly 200-400ms.
+   */
+  applyIntervalJitter(interval) {
+    const ratio = Number(this.adapter?.intervalJitterRatio || 0);
+    if (!Number.isFinite(ratio) || ratio <= 0) {
+      return interval;
+    }
+
+    const boundedRatio = Math.min(ratio, 0.9);
+    const factor = 1 + ((Math.random() * 2) - 1) * boundedRatio;
+    return Math.max(1, Math.round(interval * factor));
   }
 
   /**
