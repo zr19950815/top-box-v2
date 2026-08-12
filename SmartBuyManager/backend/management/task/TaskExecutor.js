@@ -232,21 +232,22 @@ class TaskExecutor extends EventEmitter {
         result.data.paymentError = message;
       }
 
-      // 检查进度信息
-      else if (message.includes('进度') || message.includes('成功') && message.includes('/')) {
-        const progressMatch = message.match(/(\d+)\/(\d+)/);
+      // 检查错误信息
+      else if (message.includes('错误') || message.includes('异常') || message.includes('失败')) {
+        result.category = 'SYSTEM_ERROR';
+        result.data.error = message;
+      }
+
+      // 进度可以和“购买成功”出现在同一行，需要独立解析。
+      if (message.includes('购买成功') && message.includes('进度')) {
+        const progressMatches = [...message.matchAll(/(\d+)\/(\d+)/g)];
+        const progressMatch = progressMatches[progressMatches.length - 1];
         if (progressMatch) {
           result.progress = {
             completed: parseInt(progressMatch[1]),
             total: parseInt(progressMatch[2])
           };
         }
-      }
-
-      // 检查错误信息
-      else if (message.includes('错误') || message.includes('异常') || message.includes('失败')) {
-        result.category = 'SYSTEM_ERROR';
-        result.data.error = message;
       }
 
     } catch (error) {

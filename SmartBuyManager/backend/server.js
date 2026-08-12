@@ -205,6 +205,14 @@ class SmartBuyServer {
       this.io.to(`task:${logData.taskId}`).emit('task:log', logData);
     });
 
+    taskManager.on('taskProgress', (progressUpdate) => {
+      this.io.emit('task:updated', {
+        id: progressUpdate.taskId,
+        progress: progressUpdate.progress
+      });
+      this.io.to(`task:${progressUpdate.taskId}`).emit('task:progress', progressUpdate);
+    });
+
     taskManager.on('taskDeleted', (task) => {
       this.io.emit('task:deleted', task);
     });

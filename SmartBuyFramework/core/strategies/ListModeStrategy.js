@@ -19,6 +19,8 @@ class ListModeStrategy extends PurchaseStrategy {
     this.cachedProductList = [];
     this.cacheValidDuration = 2000; // 缓存有效期2秒
     this.currentPage = 1; // 维护当前页码状态
+    this.failedProductIds = new Set();
+    this.lastAttemptedProduct = null;
   }
 
   /**
@@ -39,8 +41,9 @@ class ListModeStrategy extends PurchaseStrategy {
       throw new Error('NO_QUALIFIED_PRODUCTS');
     }
 
-    // 3. 下单。只有下单成功才清除缓存，失败时保留缓存让下一轮继续尝试其他商品
+    // 3. 下单。下单失败的挂单在本任务中不再重试。
     try {
+      this.lastAttemptedProduct = bestProduct;
       const orderResult = await this.adapter.placeOrder(bestProduct);
 
       // 下单成功，根据缓存中剩余的符合条件商品数量决定页码
@@ -48,7 +51,9 @@ class ListModeStrategy extends PurchaseStrategy {
 
       return orderResult;
     } catch (error) {
-      // 下单失败，不清除缓存，保持当前页码，让下一轮继续尝试缓存中的其他商品
+      this.failedProductIds.add(String(bestProduct.id));
+      this.clearCache();
+      this.lastAttemptedProduct = null;
       throw error;
     }
   }
@@ -99,11 +104,18 @@ class ListModeStrategy extends PurchaseStrategy {
    * @returns {Product|null} 最优商品或null
    */
   filterBestProduct(products, maxPrice, config) {
-    // 基础过滤：可购买 + 价格符合要求
-    const availableProducts = products.filter(product => 
-      product.available && 
-      product.price <= maxPrice
+    const paymentRejected = products.filter(product =>
+      product.available &&
+      product.price <= maxPrice &&
+      !this.isProductPaymentSupported(product)
+    ).length;
+    const availableProducts = products.filter(product =>
+      this.isProductQualified(product, maxPrice)
     );
+
+    if (paymentRejected > 0) {
+      console.log(`[列表模式] 💳 已过滤 ${paymentRejected} 个不支持当前钱包的商品`);
+    }
     
     if (availableProducts.length === 0) {
       console.log(`[列表模式] ❌ 没有符合条件的商品 (最高价格: ${maxPrice})`);
@@ -118,6 +130,32 @@ class ListModeStrategy extends PurchaseStrategy {
     }
     
     return bestProduct;
+  }
+
+  isProductPaymentSupported(product) {
+    if (typeof this.adapter.isProductPaymentSupported !== 'function') {
+      return true;
+    }
+    return this.adapter.isProductPaymentSupported(product);
+  }
+
+  isProductQualified(product, maxPrice) {
+    return product.available &&
+      product.price <= maxPrice &&
+      !this.failedProductIds.has(String(product.id)) &&
+      this.isProductPaymentSupported(product);
+  }
+
+  updateProgress(paymentResult) {
+    if (!paymentResult.success && this.lastAttemptedProduct?.id) {
+      const productId = String(this.lastAttemptedProduct.id);
+      this.failedProductIds.add(productId);
+      console.log(`[列表模式] ⏭️  支付失败，本任务将跳过挂单: ${productId}`);
+      this.clearCache();
+    }
+
+    super.updateProgress(paymentResult);
+    this.lastAttemptedProduct = null;
   }
 
   /**
@@ -287,7 +325,7 @@ class ListModeStrategy extends PurchaseStrategy {
   handleSuccessfulOrder(products, maxPrice) {
     // 统计当前页还有多少个符合条件的商品（排除刚刚下单的那个，因为缓存里还包含它）
     const qualifiedProducts = products.filter(product =>
-      product.available && product.price <= maxPrice
+      this.isProductQualified(product, maxPrice)
     );
 
     if (qualifiedProducts.length > 1) {

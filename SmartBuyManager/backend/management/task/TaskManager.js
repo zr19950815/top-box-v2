@@ -20,6 +20,7 @@ class TaskManager extends EventEmitter {
     // 绑定事件监听
     this.taskExecutor.on('taskStatusChanged', this.handleTaskStatusChange.bind(this));
     this.taskExecutor.on('taskLog', this.handleTaskLog.bind(this));
+    this.taskExecutor.on('taskProgress', this.handleTaskProgress.bind(this));
   }
 
   /**
@@ -376,6 +377,28 @@ class TaskManager extends EventEmitter {
    */
   handleTaskLog(taskId, logData) {
     this.emit('taskLog', { taskId, ...logData });
+  }
+
+  async handleTaskProgress(taskId, progress) {
+    try {
+      const serializedProgress = JSON.stringify(progress);
+      const updatedAt = new Date().toISOString();
+      await database.run(
+        'UPDATE tasks SET progress = ?, updated_at = ? WHERE id = ?',
+        [serializedProgress, updatedAt, taskId]
+      );
+
+      if (this.tasks.has(taskId)) {
+        Object.assign(this.tasks.get(taskId), {
+          progress,
+          updated_at: updatedAt
+        });
+      }
+
+      this.emit('taskProgress', { taskId, progress });
+    } catch (error) {
+      console.error(`❌ 更新任务进度失败: ${taskId}`, error);
+    }
   }
 
   /**

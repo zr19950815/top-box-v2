@@ -232,6 +232,12 @@ class PurchaseStrategy {
    * @returns {number} 间隔时间（毫秒）
    */
   getPlatformInterval(config) {
+    const configuredInterval = Number(config.interval);
+    if (Number.isFinite(configuredInterval) && configuredInterval > 0) {
+      console.log(`[间隔配置] 📋 使用任务配置: ${this.adapter.platformName}.smart-buy.${this.getStrategyMode()} = ${configuredInterval}ms`);
+      return configuredInterval;
+    }
+
     try {
       // 获取平台名称
       const platform = this.adapter.platformName || 'unknown';

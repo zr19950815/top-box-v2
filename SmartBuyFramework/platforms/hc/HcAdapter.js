@@ -21,6 +21,7 @@ class HcAdapter extends PlatformAdapter {
 
     this.platformName = 'hc';
     this.platformVersion = '0.1.0';
+    this.supportedPayType = 8;
 
     this.apiBaseURL = config.apiBaseURL || 'https://api.newbee.net.cn';
     this.payBaseURL = config.payBaseURL || 'https://pay.huancang.art';
@@ -546,6 +547,7 @@ class HcAdapter extends PlatformAdapter {
     }
 
     const price = Number(item.amount ?? item.price ?? item.money ?? 0);
+    const payTypes = this.normalizePayTypes(item.pay_types ?? item.payTypes);
     return {
       id: String(id),
       productId: String(item.product_id || productId),
@@ -554,8 +556,37 @@ class HcAdapter extends PlatformAdapter {
       name: item.product?.name || item.name || item.title || `商品${productId}`,
       title: item.product?.name || item.name || item.title || `商品${productId}`,
       seller: item.user_id || item.seller_id || null,
+      payTypes,
       raw: item,
     };
+  }
+
+  normalizePayTypes(value) {
+    if (value === null || value === undefined || value === '') {
+      return [];
+    }
+
+    let values = value;
+    if (typeof value === 'string') {
+      try {
+        values = JSON.parse(value);
+      } catch (error) {
+        values = value.split(',');
+      }
+    }
+
+    if (!Array.isArray(values)) {
+      values = [values];
+    }
+
+    return [...new Set(values
+      .map((payType) => Number(payType))
+      .filter(Number.isFinite))];
+  }
+
+  isProductPaymentSupported(product) {
+    return Array.isArray(product?.payTypes) &&
+      product.payTypes.includes(this.supportedPayType);
   }
 
   async placeOrder(product) {
