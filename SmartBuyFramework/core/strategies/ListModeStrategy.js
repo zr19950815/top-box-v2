@@ -18,6 +18,7 @@ class ListModeStrategy extends PurchaseStrategy {
     this.lastProductListTime = 0;
     this.cachedProductList = [];
     this.cacheValidDuration = 2000; // 缓存有效期2秒
+    this.currentPage = 1; // 维护当前页码状态
   }
 
   /**
@@ -28,16 +29,28 @@ class ListModeStrategy extends PurchaseStrategy {
   async acquireAndOrder(config) {
     // 1. 获取商品列表（可能使用缓存）
     const products = await this.getProductList(config.productId, config);
-    
+
     // 2. 筛选最优商品
     const bestProduct = this.filterBestProduct(products, config.maxPrice, config);
-    
+
     if (!bestProduct) {
+      // 没有符合条件的商品，需要判断是否翻页
+      this.handleNoQualifiedProducts(products, config.maxPrice);
       throw new Error('NO_QUALIFIED_PRODUCTS');
     }
-    
-    // 3. 下单
-    return await this.adapter.placeOrder(bestProduct);
+
+    // 3. 下单。只有下单成功才清除缓存，失败时保留缓存让下一轮继续尝试其他商品
+    try {
+      const orderResult = await this.adapter.placeOrder(bestProduct);
+
+      // 下单成功，根据缓存中剩余的符合条件商品数量决定页码
+      this.handleSuccessfulOrder(products, config.maxPrice);
+
+      return orderResult;
+    } catch (error) {
+      // 下单失败，不清除缓存，保持当前页码，让下一轮继续尝试缓存中的其他商品
+      throw error;
+    }
   }
 
   /**
@@ -49,29 +62,30 @@ class ListModeStrategy extends PurchaseStrategy {
    */
   async getProductList(productId, config) {
     const now = Date.now();
-    
+
     // 如果缓存仍然有效，使用缓存
-    if (this.cachedProductList.length > 0 && 
+    if (this.cachedProductList.length > 0 &&
         (now - this.lastProductListTime) < this.cacheValidDuration) {
       return this.cachedProductList;
     }
-    
-    // 获取新的商品列表
-    console.log(`[列表模式] 🔄 刷新商品列表...`);
-    
+
+    // 获取新的商品列表，使用当前页码
+    console.log(`[列表模式] 🔄 刷新商品列表 (第${this.currentPage}页)...`);
+
     const options = {
-      page: 1,
+      page: this.currentPage,
       pageSize: config.pageSize || 50,
       sortBy: 'price',
-      order: 'asc' // 按价格升序，优先便宜的
+      order: 'asc', // 按价格升序，优先便宜的
+      maxPrice: config.maxPrice
     };
-    
+
     const products = await this.adapter.getProductList(productId, options);
-    
+
     // 更新缓存
     this.cachedProductList = products;
     this.lastProductListTime = now;
-    
+
     console.log(`[列表模式] 📋 获取到 ${products.length} 个商品`);
     return products;
   }
@@ -227,9 +241,82 @@ class ListModeStrategy extends PurchaseStrategy {
       this.clearCache();
       console.log(`[列表模式] 🔄 已清除商品缓存，下次将重新获取`);
     }
-    
+
     // 调用父类错误处理
     super.handleError(error, config);
+  }
+
+  /**
+   * 处理没有符合条件商品的情况，决定是否翻页
+   * @private
+   * @param {Product[]} products - 当前页的商品列表
+   * @param {number} maxPrice - 最高价格
+   */
+  handleNoQualifiedProducts(products, maxPrice) {
+    if (products.length === 0) {
+      // 当前页没有任何商品，重置到第1页
+      console.log(`[列表模式] ⚠️  当前页无商品，重置到第1页`);
+      this.clearCache();
+      this.currentPage = 1;
+      return;
+    }
+
+    // 检查最后一条商品的价格
+    const lastProduct = products[products.length - 1];
+    const lastPrice = lastProduct.price;
+
+    if (lastPrice <= maxPrice && products.length >= 20) {
+      // 最后一条价格满足 且 当前页满20条，翻到下一页
+      console.log(`[列表模式] ➡️  最后一条价格${lastPrice} ≤ ${maxPrice}，翻到第${this.currentPage + 1}页`);
+      this.clearCache();
+      this.currentPage++;
+    } else {
+      // 最后一条价格不满足 或 当前页不足20条（没有下一页），重置到第1页
+      console.log(`[列表模式] 🔄 最后一条价格${lastPrice} > ${maxPrice} 或页面不满，重置到第1页`);
+      this.clearCache();
+      this.currentPage = 1;
+    }
+  }
+
+  /**
+   * 处理下单成功后的页码逻辑
+   * @private
+   * @param {Product[]} products - 当前页的商品列表
+   * @param {number} maxPrice - 最高价格
+   */
+  handleSuccessfulOrder(products, maxPrice) {
+    // 统计当前页还有多少个符合条件的商品（排除刚刚下单的那个，因为缓存里还包含它）
+    const qualifiedProducts = products.filter(product =>
+      product.available && product.price <= maxPrice
+    );
+
+    if (qualifiedProducts.length > 1) {
+      // 还有多个符合条件的商品，重置到第1页（可能有新的低价挂单）
+      console.log(`[列表模式] 🔄 当前页还有${qualifiedProducts.length}个符合条件的商品，重置到第1页`);
+      this.clearCache();
+      this.currentPage = 1;
+    } else if (qualifiedProducts.length === 1) {
+      // 只有1个符合条件的（就是刚下单的），检查是否需要翻页
+      const lastProduct = products[products.length - 1];
+      const lastPrice = lastProduct.price;
+
+      if (lastPrice <= maxPrice && products.length >= 20) {
+        // 最后一条价格满足 且 当前页满20条，翻到下一页
+        console.log(`[列表模式] ➡️  最后一条价格${lastPrice} ≤ ${maxPrice}，翻到第${this.currentPage + 1}页`);
+        this.clearCache();
+        this.currentPage++;
+      } else {
+        // 最后一条价格不满足 或 当前页不足20条，重置到第1页
+        console.log(`[列表模式] 🔄 最后一条价格${lastPrice} > ${maxPrice} 或页面不满，重置到第1页`);
+        this.clearCache();
+        this.currentPage = 1;
+      }
+    } else {
+      // 没有符合条件的商品了（理论上不应该走到这里），重置到第1页
+      console.log(`[列表模式] 🔄 无符合条件商品，重置到第1页`);
+      this.clearCache();
+      this.currentPage = 1;
+    }
   }
 }
 

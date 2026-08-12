@@ -39,16 +39,24 @@ class HcAdapter extends PlatformAdapter {
     this.useBrowserTransport = config.useBrowserTransport !== false;
     this.browserTransport = null;
     this.intervalJitterRatio = Number(config.intervalJitterRatio ?? 1 / 3);
+    this.intervalJitterRatios = config.intervalJitterRatios || {
+      list: 1 / 9,
+      quick: 1 / 9,
+    };
     this.edgeOneCooldownSchedule = (
-      config.edgeOneCooldownSchedule || [5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000]
+      config.edgeOneCooldownSchedule || [30 * 1000, 60 * 1000, 120 * 1000]
     ).map(Number).filter((value) => Number.isFinite(value) && value >= 0);
     this.edgeOneBlockCount = 0;
     this.edgeOneBlockedUntil = 0;
     this.sleep = config.sleep || ((milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    this.listPageIntervalMs = Number(config.listPageIntervalMs || 450);
     this.productConfigPath =
       config.productConfigPath ||
       path.resolve(__dirname, '../../config/products/hc.js');
+    this.combinationConfigPath =
+      config.combinationConfigPath ||
+      path.resolve(__dirname, '../../config/combinations/hc.js');
 
     this.http = axios.create({
       timeout: config.timeout || 10000,
@@ -79,12 +87,22 @@ class HcAdapter extends PlatformAdapter {
     return this.browserTransport;
   }
 
+  normalizeRequestHeaders(headers = {}) {
+    return Object.fromEntries(
+      Object.entries(headers)
+        .filter(([, value]) => value !== null && value !== undefined)
+        .map(([name, value]) => [name, String(value)])
+    );
+  }
+
   async sendHttpRequest(method, url, payload, headers, timeout) {
+    const normalizedHeaders = this.normalizeRequestHeaders(headers);
+
     if (!this.useBrowserTransport) {
       const requestConfig = {
         method,
         url,
-        headers,
+        headers: normalizedHeaders,
         timeout,
         validateStatus: () => true,
       };
@@ -104,7 +122,7 @@ class HcAdapter extends PlatformAdapter {
       const requestURL = new URL(url);
       const options = {
         method: method.toUpperCase(),
-        headers,
+        headers: normalizedHeaders,
         signal: controller.signal,
       };
 
@@ -176,7 +194,7 @@ class HcAdapter extends PlatformAdapter {
     // Keeping insertion order happens to work for the default market payload,
     // but fails as soon as a field such as `keywords` is appended later.
     const params = Object.keys(payload || {})
-      .filter((key) => payload[key] !== undefined && payload[key] !== null && payload[key] !== '')
+      .filter((key) => payload[key] !== undefined && payload[key] !== null)
       .sort()
       .map((key) => `${key}=${payload[key]}`)
       .join('&');
@@ -193,6 +211,11 @@ class HcAdapter extends PlatformAdapter {
     return /EdgeOne|请求已被站点的安全策略拦截|Access Restricted/i.test(
       response.data
     );
+  }
+
+  shouldCircuitBreakEdgeOne(url) {
+    const pathname = this.getSignPath(url);
+    return pathname.replace(/^\//, '') !== 'api/market/buy';
   }
 
   registerEdgeOneBlock() {
@@ -247,6 +270,13 @@ class HcAdapter extends PlatformAdapter {
       );
 
       if (this.isEdgeOneBlock(response)) {
+        if (!this.shouldCircuitBreakEdgeOne(url)) {
+          throw ErrorFactory.createApiError(
+            'EdgeOne 安全拦截，本次下单失败',
+            405,
+            { edgeOneBlocked: true, cooldownMs: 0 }
+          );
+        }
         const cooldownMs = this.registerEdgeOneBlock();
         throw ErrorFactory.createApiError(
           `EdgeOne 安全拦截，已暂停请求 ${Math.ceil(cooldownMs / 60000)} 分钟`,
@@ -473,21 +503,36 @@ class HcAdapter extends PlatformAdapter {
       20,
       Math.max(1, Number(options.pageSize || 20))
     );
-    const data = await this.request('get', `${this.apiBaseURL}/api/v2/market/productList`, {
-      order: 'price',
-      page: options.page || 1,
-      per_page: pageSize,
-      product_id: resolvedProductId,
-      sort: String(options.order || 'asc').toUpperCase(),
-      timestamp: Date.now(),
-    });
+    const page = Number(options.page || 1);
+
+    // 只拉取指定的单页，不再进行多页合并
+    const data = await this.request(
+      'get',
+      `${this.apiBaseURL}/api/v2/market/productList`,
+      {
+        order: 'price',
+        page,
+        per_page: pageSize,
+        product_id: resolvedProductId,
+        sort: String(options.order || 'asc').toUpperCase(),
+        timestamp: Date.now(),
+      }
+    );
 
     this.ensureSuccess(data, '获取商品列表失败');
     const list = data.data?.data || [];
 
+    const seenIds = new Set();
     return list
       .map((item) => this.normalizeProduct(item, resolvedProductId))
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter((product) => {
+        if (seenIds.has(product.id)) {
+          return false;
+        }
+        seenIds.add(product.id);
+        return true;
+      });
   }
 
   normalizeProduct(item, productId) {
@@ -1133,20 +1178,320 @@ class HcAdapter extends PlatformAdapter {
     return null;
   }
 
-  async confirmCombination(combinationId) {
-    const { id, itemIds } = this.parseCombinationId(combinationId);
+  async confirmCombination(combinationReference) {
+    // 保留旧的手工实例 ID 格式，方便已有任务平滑迁移。
+    if (String(combinationReference || '').includes(':')) {
+      const { id, itemIds } = this.parseCombinationId(combinationReference);
+      return this.submitCombination(id, itemIds.split(','));
+    }
+
+    const combination = await this.resolveCombinationByName(combinationReference);
+    const { itemIds, ysItemIds } = await this.resolveCombinationMaterialInstanceIds(
+      combination
+    );
+    return this.submitCombination(combination.id, itemIds, ysItemIds);
+  }
+
+  /**
+   * 获取 HC 藏品的最近成交记录。
+   * NewBee H5 使用 /api/market/getTradeList，接口要求先登录，但只读取成交数据。
+   * @param {string} productId 商品 ID 或配置中的商品名称
+   * @param {Object} [options]
+   * @param {number} [options.limit=50] 返回条数，上限 50
+   */
+  async getRecentTrades(productId, options = {}) {
+    const resolvedProductId = await this.resolveProductId(
+      productId,
+      options.productConfig
+    );
+    const limit = Math.max(1, Math.min(50, Number(options.limit || 50)));
+    const data = await this.request(
+      'get',
+      `${this.apiBaseURL}/api/market/getTradeList`,
+      {
+        id: resolvedProductId,
+        page: 1,
+        per_page: limit,
+        timestamp: Date.now(),
+      }
+    );
+    this.ensureSuccess(data, '获取最近成交记录失败');
+
+    const rows = Array.isArray(data.data) ? data.data : [];
+    return {
+      productId: String(resolvedProductId),
+      trades: rows.slice(0, limit).map((trade) => ({
+        serialNumber: trade.no == null ? null : String(trade.no),
+        price: Number(trade.price),
+        timestamp: Number(trade.time),
+        time: Number.isFinite(Number(trade.time))
+          ? new Date(Number(trade.time) * 1000).toISOString()
+          : null,
+      })).filter((trade) => Number.isFinite(trade.price)),
+    };
+  }
+
+  async submitCombination(id, itemIds, ysItemIds = []) {
     const data = await this.request(
       'post',
       `${this.apiBaseURL}/api/product_merge_material/newmerge`,
       {
         id,
-        item_ids: itemIds,
+        item_ids: itemIds.join(','),
+        ys_item_ids: ysItemIds.join(','),
         timestamp: Date.now(),
       }
     );
 
     this.ensureSuccess(data, '合成失败', ErrorTypes.REQUEST_FAILED);
     return true;
+  }
+
+  loadCombinationConfig() {
+    if (!fs.existsSync(this.combinationConfigPath)) {
+      return {};
+    }
+
+    try {
+      const resolvedPath = require.resolve(this.combinationConfigPath);
+      delete require.cache[resolvedPath];
+      return require(resolvedPath) || {};
+    } catch (error) {
+      throw ErrorFactory.createValidationError(
+        `读取 HC 合成配置失败: ${error.message}`
+      );
+    }
+  }
+
+  writeCombinationConfig(combinations) {
+    fs.mkdirSync(path.dirname(this.combinationConfigPath), { recursive: true });
+    const content = [
+      '/**',
+      ' * HC / Huancang 合成活动目录。由程序自动同步，请勿保存账号、密码或实例 ID。',
+      ' */',
+      '',
+      `module.exports = ${JSON.stringify(combinations, null, 2)};`,
+      '',
+    ].join('\n');
+    fs.writeFileSync(this.combinationConfigPath, content, 'utf8');
+  }
+
+  async fetchCombinationCatalog() {
+    const pageSize = Math.max(
+      1,
+      Math.min(50, Number(this.options.combinationCatalogPageSize || 20))
+    );
+    const all = [];
+
+    // 前端将“限时活动”和“常驻活动”分别以 bf_type=0/1 查询。
+    for (const bfType of [0, 1]) {
+      let page = 1;
+      let hasMore = true;
+      while (hasMore) {
+        const data = await this.request('get', `${this.apiBaseURL}/api/product_merge`, {
+          page,
+          per_page: pageSize,
+          subject: '',
+          bf_type: bfType,
+          merge_type: 2,
+          timestamp: Date.now(),
+        });
+        this.ensureSuccess(data, '获取 HC 合成活动列表失败');
+        const payload = data.data || {};
+        const rows = Array.isArray(payload.data) ? payload.data : [];
+        all.push(...rows);
+        hasMore = Boolean(payload.has_more) || (
+          Number(payload.current_page || page) < Number(payload.last_page || page)
+        );
+        page += 1;
+      }
+    }
+
+    return [...new Map(all.filter((item) => item && item.id != null)
+      .map((item) => [String(item.id), item])).values()];
+  }
+
+  normalizeCombination(listItem, detail) {
+    const productList = Array.isArray(detail?.product_list) ? detail.product_list : [];
+    const materials = productList.map((condition, index) => ({
+      condition: index + 1,
+      quantity: Number(condition.quantity || 1),
+      products: (Array.isArray(condition.product) ? condition.product : [])
+        .filter((product) => product && product.id != null)
+        .map((product) => ({
+          productId: String(product.id),
+          name: product.subject || product.name || String(product.id),
+          type: product.type || '',
+      })),
+    })).filter((condition) => condition.products.length > 0);
+
+    const statusText = this.getCombinationStatusText(detail?.merge_info?.status);
+    const scheduleText = [detail?.merge_info?.starttime, detail?.merge_info?.endtime]
+      .filter(Boolean)
+      .join(' ~ ');
+
+    if (!listItem?.code || !detail?.subject || materials.length === 0) {
+      throw ErrorFactory.createValidationError(
+        `HC 合成活动“${detail?.subject || listItem?.id || '未知'}”未返回可用素材配方` +
+        `${statusText ? `（状态: ${statusText}` : ''}` +
+        `${scheduleText ? `${statusText ? '，' : '（'}时间: ${scheduleText}` : ''}` +
+        `${statusText || scheduleText ? '）' : ''}`
+      );
+    }
+
+    return {
+      // newmerge 的 id 是活动 code，详情接口使用 detailId。
+      id: String(listItem.code),
+      detailId: String(listItem.id),
+      name: detail.subject,
+      materials,
+      logic: Number(detail.logic || 0),
+      quantity: Number(detail.quantity || 0),
+      isBatch: Number(detail.is_batch || 0) === 1,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  getCombinationStatusText(status) {
+    const normalized = String(status ?? '');
+    return {
+      0: '未开始',
+      1: '进行中',
+      2: '已抢完',
+      3: '已结束',
+    }[normalized] || (normalized ? `未知(${normalized})` : '');
+  }
+
+  async syncCombinationCatalog() {
+    const list = await this.fetchCombinationCatalog();
+    const combinations = {};
+
+    for (const listItem of list) {
+      const detailData = await this.request(
+        'get',
+        `${this.apiBaseURL}/api/v2/product_merge_material/getMaterial`,
+        { id: listItem.id, timestamp: Date.now() }
+      );
+      if (detailData?.code !== 1) {
+        Logger.warn(`[HC] 跳过无法读取配方的合成活动: ${listItem.subject || listItem.id}`);
+        continue;
+      }
+
+      try {
+        const combination = this.normalizeCombination(listItem, detailData.data);
+        combinations[combination.name] = combination;
+      } catch (error) {
+        Logger.warn(`[HC] 跳过无法解析配方的合成活动: ${error.message}`);
+      }
+    }
+
+    this.writeCombinationConfig(combinations);
+    Logger.info(`[HC] 已同步 ${Object.keys(combinations).length} 个合成活动到本地配置`);
+    return combinations;
+  }
+
+  async resolveCombinationByName(name) {
+    const requestedName = String(name || '').trim();
+    if (!requestedName) {
+      throw ErrorFactory.createValidationError('HC 合成名称不能为空');
+    }
+
+    let combinations = this.loadCombinationConfig();
+    let combination = combinations[requestedName];
+    if (!combination) {
+      combination = Object.values(combinations).find((item) => item?.name === requestedName);
+    }
+    if (!combination) {
+      combinations = await this.syncCombinationCatalog();
+      combination = combinations[requestedName] || Object.values(combinations)
+        .find((item) => item?.name === requestedName);
+    }
+    if (!combination) {
+      throw ErrorFactory.createBusinessError(
+        `未找到可合成活动“${requestedName}”，已完成一次活动目录同步`,
+        ErrorTypes.PRODUCT_UNAVAILABLE
+      );
+    }
+    return combination;
+  }
+
+  async getUserCollectiblesByProductId(productId, materialType = '') {
+    const all = [];
+    let page = 1;
+    let hasMore = true;
+    while (hasMore) {
+      const payload = {
+        product_id: productId,
+        type: 'confirm',
+        page,
+        per_page: 50,
+        timestamp: Date.now(),
+      };
+      if (materialType === 'digital') {
+        payload.product_type = 'digital';
+      }
+      const data = await this.request('get', `${this.apiBaseURL}/api/user_collect`, payload);
+      this.ensureSuccess(data, `获取素材 ${productId} 的账号库存失败`);
+      const result = data.data || {};
+      const rows = Array.isArray(result.data) ? result.data : [];
+      all.push(...rows);
+      hasMore = Boolean(result.has_more);
+      page += 1;
+    }
+
+    return all.filter((record) => {
+      const status = record?.status;
+      return status === undefined || status === null || String(status) === '2';
+    }).map((record) => ({
+      // 官方 H5 前端最终把 user_collect.item_id（即 item.id）提交到 newmerge。
+      instanceId: String(record.item_id ?? record.item?.id ?? record.id),
+      productId: String(record.product_id ?? productId),
+      type: materialType,
+    })).filter((record) => record.instanceId && record.instanceId !== 'undefined');
+  }
+
+  async resolveCombinationMaterialInstanceIds(combination) {
+    const inventoryByProduct = new Map();
+    const getInventory = async (product) => {
+      const key = `${product.type || ''}:${product.productId}`;
+      if (!inventoryByProduct.has(key)) {
+        inventoryByProduct.set(
+          key,
+          await this.getUserCollectiblesByProductId(product.productId, product.type)
+        );
+      }
+      return inventoryByProduct.get(key);
+    };
+
+    const itemIds = [];
+    const ysItemIds = [];
+    for (const condition of combination.materials || []) {
+      let remaining = Number(condition.quantity || 1);
+      for (const product of condition.products || []) {
+        if (remaining <= 0) break;
+        const inventory = await getInventory(product);
+        const selected = inventory.splice(0, remaining);
+        selected.forEach((record) => {
+          if (record.type === 'digital') {
+            ysItemIds.push(record.instanceId);
+          } else {
+            itemIds.push(record.instanceId);
+          }
+        });
+        remaining -= selected.length;
+      }
+      if (remaining > 0) {
+        throw ErrorFactory.createBusinessError(
+          `合成“${combination.name}”的第 ${condition.condition || '?'} 组素材不足，还缺 ${remaining} 件`,
+          ErrorTypes.PRODUCT_UNAVAILABLE
+        );
+      }
+    }
+
+    if (itemIds.length + ysItemIds.length === 0) {
+      throw ErrorFactory.createBusinessError('未找到可用于合成的素材实例', ErrorTypes.PRODUCT_UNAVAILABLE);
+    }
+    return { itemIds, ysItemIds };
   }
 
   parseCombinationId(combinationId) {

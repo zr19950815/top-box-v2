@@ -163,16 +163,18 @@ class PurchaseStrategy {
   shouldStopOnError(error) {
     const stopErrors = [
       'PAYMENT_FAILED',
-      'INSUFFICIENT_BALANCE', 
+      'INSUFFICIENT_BALANCE',
       'ACCOUNT_LOCKED',
       'INVALID_CREDENTIALS',
+      'UNAUTHORIZED',
       '用户未登录',
+      '请登录后操作',
       'TOKEN_EXPIRED',
       'AUTH_ERROR',
       'LOGIN_FAILED'
     ];
-    
-    return stopErrors.some(stopError => 
+
+    return stopErrors.some(stopError =>
       error.message.includes(stopError) || error.type === stopError
     );
   }
@@ -194,11 +196,16 @@ class PurchaseStrategy {
   }
 
   /**
-   * Apply adapter-specific random jitter while preserving the configured
-   * average interval. HC uses 1/3, so a 300ms target becomes roughly 200-400ms.
+   * Apply adapter- and mode-specific random jitter while preserving the
+   * configured average interval.
    */
   applyIntervalJitter(interval) {
-    const ratio = Number(this.adapter?.intervalJitterRatio || 0);
+    const mode = this.getStrategyMode();
+    const ratio = Number(
+      this.adapter?.intervalJitterRatios?.[mode] ??
+      this.adapter?.intervalJitterRatio ??
+      0
+    );
     if (!Number.isFinite(ratio) || ratio <= 0) {
       return interval;
     }
