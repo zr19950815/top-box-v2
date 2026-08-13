@@ -12,6 +12,10 @@ const path = require('path');
 
 const config = require('./config/config');
 const database = require('./database/Database');
+const productConfigManager = require(`${config.framework.path}/config/ProductConfigManager`);
+const QQBotBridge = require('./integrations/qq/QQBotBridge');
+const NewBeeAnnouncementMonitor = require('./integrations/qq/NewBeeAnnouncementMonitor');
+const HcAdapter = require(`${config.framework.path}/platforms/hc/HcAdapter`);
 
 // 导入路由
 const { router: tasksRouter, taskManager } = require('./api/routes/tasks');
@@ -27,6 +31,37 @@ class SmartBuyServer {
     });
     
     this.connectedClients = new Set();
+    this.qqBot = new QQBotBridge({
+      config: config.qqBot,
+      taskManager
+    });
+    const newBeeAdapter = new HcAdapter(null);
+    this.newBeeAnnouncementMonitor = new NewBeeAnnouncementMonitor({
+      config: config.newBeeAnnouncements,
+      qqBot: this.qqBot,
+      fetchAnnouncements: async () => {
+        const response = await newBeeAdapter.request(
+          'get',
+          `${newBeeAdapter.apiBaseURL}/api/news`,
+          { page: 1, per_page: 20, timestamp: Date.now() }
+        );
+        if (response?.code !== 1 || !Array.isArray(response?.data?.data)) {
+          throw new Error(response?.msg || 'NewBee 公告列表返回异常');
+        }
+        return response.data.data;
+      },
+      fetchAnnouncementDetail: async id => {
+        const response = await newBeeAdapter.request(
+          'get',
+          `${newBeeAdapter.apiBaseURL}/api/news/content`,
+          { id, timestamp: Date.now() }
+        );
+        if (response?.code !== 1 || !response?.data || typeof response.data.content !== 'string') {
+          throw new Error(response?.msg || `NewBee 公告正文返回异常: ${id}`);
+        }
+        return response.data;
+      }
+    });
   }
 
   /**
@@ -38,7 +73,17 @@ class SmartBuyServer {
 
       // 连接数据库
       await database.connect();
+      await database.ensureTaskOwnershipSchema();
       console.log('✅ 数据库连接成功');
+
+      // 执行凭据（含米玛）只存在内存中，从不落盘，因此上个进程未跑完的任务
+      // 无法恢复执行。先统一标成 interrupted，避免 DB 里留下永久 running 的
+      // 僵尸任务；待通知列表在 QQ 连接就绪后补发。
+      this.interruptedTasks = await taskManager.recoverInterruptedTasks();
+
+      // Manager 直接复用 Framework 的 CommandParser，创建任务前需先
+      // 初始化同一份商品配置。
+      await productConfigManager.initialize();
 
       // 配置中间件
       this.setupMiddleware();
@@ -51,6 +96,14 @@ class SmartBuyServer {
 
       // 配置事件监听
       this.setupEventListeners();
+
+      // QQ integration is explicitly enabled through QQ_BOT_ENABLED.
+      this.qqBot.start();
+      this.newBeeAnnouncementMonitor.start();
+
+      // 通知失败不能影响启动，因此不 await 也不向上抛。
+      this.qqBot.notifyInterruptedTasks(this.interruptedTasks || [])
+        .catch(() => console.error('QQ Bot 中断通知入队失败'));
 
       console.log('✅ 服务器初始化完成');
     } catch (error) {
@@ -126,7 +179,8 @@ class SmartBuyServer {
             tasks: stats,
             websocket: {
               connectedClients: this.connectedClients.size
-            }
+            },
+            qqBot: this.qqBot.getStatus()
           }
         });
       } catch (error) {
@@ -281,6 +335,8 @@ class SmartBuyServer {
 
     // 关闭WebSocket连接
     this.io.close();
+    this.newBeeAnnouncementMonitor.stop();
+    await this.qqBot.stop();
 
     // 关闭HTTP服务器
     return new Promise((resolve) => {
@@ -319,9 +375,11 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+// 不因单个 Promise 拒绝退出进程。QQ 桥接与 NapCat 是网络组件，断线、action
+// 超时都会产生被拒绝的 Promise；退出会连带中断所有在跑的任务，而执行凭据只在
+// 内存中、无法恢复。记录后继续运行，由各任务自己的失败路径收尾。
+process.on('unhandledRejection', (reason) => {
   console.error('💥 未处理的Promise拒绝:', reason);
-  process.exit(1);
 });
 
 // 如果直接运行此文件，启动服务器

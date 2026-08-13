@@ -1,0 +1,18 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker@sha256:02ddf329894887552bc6207a41e471bcf51ef0f04751804905aeb8cf1f737d4f
+    container_name: topbox-napcat
+    restart: unless-stopped
+    mem_limit: 384m
+    pids_limit: 256
+    environment:
+      NAPCAT_UID: "${NAPCAT_UID:-1000}"
+      NAPCAT_GID: "${NAPCAT_GID:-1000}"
+      WEBUI_TOKEN: "${QQ_BOT_WEBUI_TOKEN}"
+      ACCOUNT: "${QQ_BOT_ACCOUNT}"
+    ports:
+      - "127.0.0.1:3002:3001"
+      - "127.0.0.1:6099:6099"
+    volumes:
+      - ./storage/napcat/config:/app/napcat/config
+      - ./storage/napcat/qq:/app/.config/QQ

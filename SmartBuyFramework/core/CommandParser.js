@@ -18,7 +18,9 @@ class CommandParser {
       throw new Error('Command string is required and must be a string');
     }
 
-    console.log(`[指令解析器] 🔍 解析指令: ${commandString}`);
+    // 指令中包含登录/支付密码，日志只保留指令类型，避免把凭据写入终端日志。
+    commandString = this.normalizeCommandAlias(commandString.trim());
+    console.log(`[指令解析器] 🔍 解析指令: ${commandString.split('-')[0]}`);
 
     try {
       // 智能分割：支持[]括号内的-符号不被分割
@@ -48,7 +50,7 @@ class CommandParser {
         platform: result.platform,
         task: result.task,
         mode: result.mode,
-        account: result.params.account
+        account: this.maskAccount(result.params.account)
       });
 
       return result;
@@ -57,6 +59,30 @@ class CommandParser {
       console.error(`[指令解析器] ❌ 解析失败: ${error.message}`);
       throw new Error(`Command parsing failed: ${error.message}`);
     }
+  }
+
+  static maskAccount(account) {
+    const value = String(account || '');
+    if (value.length < 7) return value ? '***' : null;
+    return `${value.slice(0, 3)}****${value.slice(-4)}`;
+  }
+
+  static normalizeCommandAlias(commandString) {
+    const aliases = {
+      '幻藏指定': 'hc列表',
+      '幻藏自助': 'hc快捷',
+      '幻藏批量': 'hc批量',
+      '幻藏合成': 'hc合成',
+      '幻藏成交': 'hc成交',
+      '幻藏取消': 'hc取消',
+      '幻藏上架': 'hc上架',
+    };
+    const separator = commandString.indexOf('-');
+    const command = separator === -1 ? commandString : commandString.slice(0, separator);
+    const normalized = aliases[command];
+    return normalized
+      ? `${normalized}${separator === -1 ? '' : commandString.slice(separator)}`
+      : commandString;
   }
 
   /**
@@ -95,7 +121,7 @@ class CommandParser {
       parts.push(current);
     }
     
-    console.log(`[指令解析器] 智能分割结果:`, parts);
+    console.log(`[指令解析器] 智能分割完成，共 ${parts.length} 段参数`);
     return parts;
   }
 
@@ -139,7 +165,9 @@ class CommandParser {
       'hc快捷': { platform: 'hc', task: 'smart-buy', mode: 'quick' },
       'hc批量': { platform: 'hc', task: 'smart-buy', mode: 'batch' },
       'hc合成': { platform: 'hc', task: 'combination' },
+      'hc成交': { platform: 'hc', task: 'trade-history', mode: 'history' },
       'hc取消': { platform: 'hc', task: 'cancel-resale' },
+      'hc上架': { platform: 'hc', task: 'listing', mode: 'on-sale' },
       
       // TopBox平台指令（未来扩展）
       'tb列表': { platform: 'topbox', task: 'smart-buy', mode: 'list' },
@@ -168,6 +196,37 @@ class CommandParser {
    * @returns {Object} 解析后的参数
    */
   static parseParams(params, taskType, platform) {
+    // HC 的合成无需支付密码。新格式使用活动名称，让适配器自动同步配方并
+    // 查询账号下可用的素材实例：hc合成-手机号-登录密码-合成名称。
+    if (platform === 'hc' && taskType === 'combination' && params.length === 3) {
+      const [account, password, combinationName] = params;
+      if (!account || !password || !combinationName) {
+        throw new Error('HC 合成参数不能为空。格式: hc合成-手机号-登录密码-合成名称');
+      }
+      return {
+        account,
+        password,
+        payPassword: null,
+        authMode: 'password',
+        combinationId: combinationName,
+        combinationName,
+      };
+    }
+
+    if (platform === 'hc' && taskType === 'trade-history' && params.length === 3) {
+      const [account, password, productId] = params;
+      if (!account || !password || !productId) {
+        throw new Error('HC 成交查询参数不能为空。格式: hc成交-手机号-登录密码-商品名称/ID');
+      }
+      return {
+        account,
+        password,
+        payPassword: null,
+        authMode: 'password',
+        productId,
+      };
+    }
+
     const baseParams = this.parseBaseParams(params);
     
     switch (taskType) {
@@ -175,10 +234,16 @@ class CommandParser {
         return this.parseSmartBuyParams(baseParams, params, platform);
         
       case 'combination':
-        return this.parseCombinationParams(baseParams, params);
+        return this.parseCombinationParams(baseParams, params, platform);
+
+      case 'trade-history':
+        return this.parseTradeHistoryParams(baseParams, params);
         
       case 'cancel-resale':
         return this.parseCancelResaleParams(baseParams, params);
+
+      case 'listing':
+        return this.parseListingParams(baseParams, params, platform);
         
       default:
         return baseParams;
@@ -301,7 +366,9 @@ class CommandParser {
           },
           quantity,
           maxPrice,
-          interval: 800,
+          // 不在此处写死间隔：解析器给出 interval 会覆盖
+          // config/intervals/<platform>.js 与自适应调频，使配置形同废纸。
+          // 间隔交由 PurchaseStrategy.getPlatformInterval 决定。
           batchSize: params[4] ? parseInt(params[4], 10) : undefined
         };
       }
@@ -319,7 +386,6 @@ class CommandParser {
           },
           quantity,
           maxPrice,
-          interval: 800,
           batchSize: params[4] ? parseInt(params[4], 10) : undefined
         };
       } else {
@@ -334,9 +400,8 @@ class CommandParser {
       productId: productConfig.id, // 保持兼容性
       productConfig: productConfig, // 完整的商品配置对象
       quantity,
-      maxPrice,
       // 可选参数
-      interval: 800, // 默认间隔
+      maxPrice,
       batchSize: params[4] ? parseInt(params[4], 10) : undefined // 批量大小（可选）
     };
   }
@@ -348,7 +413,7 @@ class CommandParser {
    * @param {string[]} params - 参数数组
    * @returns {Object} 合成确认参数
    */
-  static parseCombinationParams(baseParams, params) {
+  static parseCombinationParams(baseParams, params, platform) {
     if (params.length < 4) {
       throw new Error('Missing combination ID for combination task. Expected: account-password-payPassword-combinationId');
     }
@@ -361,8 +426,21 @@ class CommandParser {
 
     return {
       ...baseParams,
-      combinationId
+      combinationId,
+      // 兼容 HC 旧格式：hc合成-账号-登录密码-支付密码-合成ID:素材实例ID1,素材实例ID2
+      ...(platform === 'hc' ? { combinationName: combinationId } : {})
     };
+  }
+
+  /**
+   * 解析成交历史查询参数。
+   * @private
+   */
+  static parseTradeHistoryParams(baseParams, params) {
+    if (params.length < 4 || !params[3]) {
+      throw new Error('Missing product for trade-history task. Expected: account-password-payPassword-productName/productId');
+    }
+    return { ...baseParams, productId: params[3] };
   }
 
   /**
@@ -385,7 +463,68 @@ class CommandParser {
 
     return {
       ...baseParams,
-      resaleId
+      resaleId,
+      productId: resaleId,
+      productName: resaleId,
+    };
+  }
+
+  /**
+   * 解析上架参数：hc上架-账号-米玛-支付米玛-藏品*数量*挂单价
+   *
+   * 不复用 parseSmartBuyParams。买入的第三段是「最高价」（上限，实际成交可能更
+   * 低），上架的第三段是「挂单价」（精确值），两者语义不同；借用买入解析还会
+   * 顺带引入商品配置兜底与批量大小等对上架无意义的字段。
+   * @private
+   */
+  static parseListingParams(baseParams, params, platform) {
+    if (platform !== 'hc') throw new Error('Listing task is only supported for HC');
+
+    const specIndex = baseParams.authMode === 'token'
+      ? (baseParams.account ? 3 : 2)
+      : 3;
+
+    if (params.length <= specIndex || !params[specIndex]) {
+      throw new Error('缺少上架参数。格式: hc上架-账号-米玛-支付米玛-藏品名称*数量*挂单价');
+    }
+
+    const specParts = params[specIndex].split('*');
+    if (specParts.length !== 3) {
+      throw new Error('上架参数格式应为: 藏品名称*数量*挂单价');
+    }
+
+    const [productIdentifier, rawQuantity, rawAmount] = specParts;
+    const quantity = parseInt(rawQuantity, 10);
+    const amount = parseFloat(rawAmount);
+
+    if (!productIdentifier) throw new Error('藏品名称不能为空');
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error('上架数量必须为正整数');
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error('挂单价必须大于 0');
+    }
+
+    // 名称解析最终由适配器负责（静态未命中时会走动态目录同步），因此静态配置
+    // 不可用时不应让解析失败。
+    let productConfig = null;
+    try {
+      productConfig = ProductConfigManager.getProductConfig(platform, productIdentifier);
+    } catch (error) {
+      console.warn(`[指令解析器] ⚠️  静态商品配置不可用，交由适配器解析: ${productIdentifier}`);
+    }
+
+    return {
+      ...baseParams,
+      productId: productConfig?.id || productIdentifier,
+      productConfig: productConfig || {
+        name: productIdentifier,
+        platform,
+        id: productIdentifier,
+        unresolved: true,
+      },
+      quantity,
+      amount,
     };
   }
 
@@ -423,7 +562,11 @@ class CommandParser {
         }
       }
       
-      if (!parseResult.params.payPassword) {
+      const noPayPasswordRequired = parseResult.platform === 'hc' && [
+        'combination',
+        'trade-history',
+      ].includes(parseResult.task);
+      if (!parseResult.params.payPassword && !noPayPasswordRequired) {
         throw new Error('Missing pay password');
       }
 
@@ -446,10 +589,22 @@ class CommandParser {
             throw new Error('Missing combinationId for combination task');
           }
           break;
+
+        case 'trade-history':
+          if (!parseResult.params.productId) {
+            throw new Error('Missing productId for trade-history task');
+          }
+          break;
           
         case 'cancel-resale':
           if (!parseResult.params.resaleId) {
             throw new Error('Missing resaleId for cancel-resale task');
+          }
+          break;
+
+        case 'listing':
+          if (!parseResult.params.productId || !parseResult.params.quantity || !parseResult.params.amount) {
+            throw new Error('Missing listing parameters');
           }
           break;
       }
@@ -479,7 +634,12 @@ SmartBuy Framework 指令格式说明:
 🔗 简单任务:
   ky合成-手机号-登录密码-支付密码-合成ID
   ky取消-手机号-登录密码-支付密码-寄售ID
-  hc合成-手机号-登录密码-支付密码-合成ID:素材ID1,素材ID2
+  hc合成-手机号-登录密码-合成名称
+    （自动同步活动配方、查询库存素材实例并提交）
+  hc合成-手机号-登录密码-支付密码-合成ID:素材实例ID1,素材实例ID2
+    （旧格式，兼容保留）
+  hc成交-手机号-登录密码-商品名称/ID
+    （查询最近 50 笔成交，仅读取数据）
   hc取消-手机号-登录密码-支付密码-商品ID
 
 🔑 Token模式（新增）:

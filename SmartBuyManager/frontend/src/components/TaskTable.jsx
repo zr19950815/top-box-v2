@@ -47,6 +47,8 @@ const TaskTable = () => {
     completed: { color: 'success', text: '已完成' },
     failed: { color: 'error', text: '失败' },
     stopped: { color: 'default', text: '已停止' },
+    // 服务重启导致的中断。执行凭据只存在内存中，无法自动恢复，需重新提交。
+    interrupted: { color: 'warning', text: '已中断' },
   };
 
   // 平台标签配置

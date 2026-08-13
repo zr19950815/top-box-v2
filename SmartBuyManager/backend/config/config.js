@@ -3,6 +3,7 @@
  */
 
 const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 
 const config = {
   // 服务配置
@@ -51,7 +52,9 @@ const config = {
 
   // 任务配置
   tasks: {
-    maxConcurrent: 10,        // 最大并发任务数
+    // TaskManager 读的是这个字段，此前它被硬编码，导致 MAX_CONCURRENT_TASKS
+    // 环境变量实际无效。
+    maxConcurrent: Number(process.env.MAX_CONCURRENT_TASKS || 10),
     defaultTimeout: Number(process.env.TASK_TIMEOUT_MS || 0),
     retryAttempts: 3,         // 失败重试次数
     cleanupInterval: 3600000, // 清理间隔(1小时)
@@ -66,6 +69,31 @@ const config = {
     },
     pingTimeout: 60000,
     pingInterval: 25000
+  },
+
+  // NapCat OneBot 11 integration. The bridge is opt-in so a regular Manager
+  // startup never creates QQ tasks accidentally.
+  qqBot: {
+    enabled: process.env.QQ_BOT_ENABLED === 'true',
+    websocketUrl: process.env.QQ_BOT_WS_URL || 'ws://127.0.0.1:3002',
+    accessToken: process.env.QQ_BOT_ACCESS_TOKEN || '',
+    commandPrefix: process.env.QQ_BOT_COMMAND_PREFIX || '/topbox',
+    // 私聊任务对所有好友开放：谁提交任务，任务就绑定给谁，没有 QQ 白名单。
+    // 群聊没有任何交互入口，因此也不存在群白名单。
+    directCommandsEnabled: process.env.QQ_BOT_DIRECT_COMMANDS_ENABLED === 'true',
+    privateTestReply: process.env.QQ_BOT_PRIVATE_TEST_REPLY || '',
+    reconnectInterval: Number(process.env.QQ_BOT_RECONNECT_INTERVAL_MS || 5000),
+    actionTimeout: Number(process.env.QQ_BOT_ACTION_TIMEOUT_MS || 10000)
+  },
+
+  newBeeAnnouncements: {
+    enabled: process.env.NEWBEE_ANNOUNCEMENT_ENABLED === 'true',
+    interval: Number(process.env.NEWBEE_ANNOUNCEMENT_INTERVAL_MS || 60000),
+    groupId: process.env.NEWBEE_ANNOUNCEMENT_QQ_GROUP || '',
+    stateFile: process.env.NEWBEE_ANNOUNCEMENT_STATE_FILE || path.join(
+      __dirname,
+      '../../storage/qq/newbee-announcement.json'
+    )
   },
 
   // 监控配置

@@ -1,14 +1,16 @@
 {
   "schemaVersion": 1,
   "projectName": "top-box-v2",
-  "updatedAt": "2026-08-11T15:59:16+08:00",
+  "updatedAt": "2026-08-13T19:49:00+08:00",
   "deployed": true,
   "lastStatus": "success",
-  "summary": "tool-124 部署健康，HC 列表购买任务正在运行",
+  "summary": "QQ 私聊任务控制发布，含发布后增量修复：成交记录改上海时间并加表头、成交查询不发登录回执、失败通知上报真实原因、清理历史任务明文凭据",
   "deploymentPlanPath": "docs/deployments/deployment-plan.md",
   "deploymentPatternPath": "docs/deployments/deployment-pattern.md",
-  "verifiedAt": "2026-08-11T15:59:16+08:00",
+  "verifiedAt": "2026-08-13T19:49:00+08:00",
   "verificationStatus": "passed",
+  "currentRelease": "20260813174244",
+  "rollbackRelease": "20260813122348",
   "remote": {
     "host": "124.221.245.146",
     "port": "22",
@@ -18,49 +20,26 @@
   },
   "git": {
     "branch": "main",
-    "commit": "0431b8b",
+    "commit": "3c73a92",
     "workingTreeDirty": true
   },
   "services": [
     {
-      "name": "smartbuy-manager"
+      "name": "smartbuy-manager",
+      "restarted": true
     },
     {
-      "name": "nginx"
+      "name": "topbox-napcat",
+      "restarted": false
     }
   ],
   "ports": [
-    3000,
-    3001
+    3001,
+    3002
   ],
   "healthUrls": [
-    "http://124.221.245.146:3000/api/health",
-    "http://127.0.0.1:3001/api/health"
+    "http://127.0.0.1:3001/api/health",
+    "http://127.0.0.1:3001/api/status"
   ],
-  "knownIssues": [],
-  "runtime": {
-    "currentRelease": "/www/wwwroot/top-box-v2/releases/20260811112400",
-    "rollbackRelease": "/www/wwwroot/top-box-v2/releases/20260513114255",
-    "pm2Status": "online",
-    "pm2Instances": 1,
-    "nginxStatus": "active",
-    "pm2BootEnabled": true,
-    "internalHealthPassed": true,
-    "proxyHealthPassed": true
-  },
-  "activeTasks": [
-    {
-      "id": "task_1786420120041_hc_list_knxor",
-      "platform": "hc",
-      "mode": "list",
-      "status": "running",
-      "childProcessCount": 1,
-      "progress": {
-        "completed": 0,
-        "total": 5
-      },
-      "error": null,
-      "lastObservedListingCount": 20
-    }
-  ]
+  "knownIssues": []
 }

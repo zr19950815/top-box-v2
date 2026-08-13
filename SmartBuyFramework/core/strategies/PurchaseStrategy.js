@@ -6,6 +6,7 @@
  */
 
 const IntervalConfigManager = require('../../config/IntervalConfigManager');
+const { ErrorTypes } = require('../../utils/ErrorTypes');
 
 class PurchaseStrategy {
   /**
@@ -57,10 +58,13 @@ class PurchaseStrategy {
           // Step 4: 更新进度（统一逻辑）
           this.updateProgress(paymentResult);
           
+          this.recordCycleOutcome(null);
+
         } catch (error) {
+          this.recordCycleOutcome(error);
           this.handleError(error, config);
         }
-        
+
         // 控制执行间隔 - 使用平台配置的间隔
         const platformInterval = this.applyIntervalJitter(
           this.getPlatformInterval(config)
@@ -196,6 +200,69 @@ class PurchaseStrategy {
   }
 
   /**
+   * 把本轮结果喂给自适应控制器。
+   *
+   * 关键区分：`NO_QUALIFIED_PRODUCTS` 表示市场上暂无符合价格的挂单，属正常
+   * 业务状态而非限流信号——抢购任务等挂单时会持续产生它，若据此降速，任务会
+   * 越等越慢，与目的相反。
+   *
+   * @protected
+   * @param {Error|null} error - 本轮抛出的错误，成功时为 null
+   */
+  recordCycleOutcome(error) {
+    const mode = this.getStrategyMode();
+    const controller = this.adapter?.getIntervalController?.(mode);
+    if (!controller) return;
+
+    // 定期同步跨进程的并发预算（读写共享文件，因此按时间节流而非每轮执行）。
+    const now = Date.now();
+    if (!this.lastSharedSyncAt || now - this.lastSharedSyncAt >= 10000) {
+      this.lastSharedSyncAt = now;
+      this.adapter.syncSharedInterval?.();
+    }
+
+    // 仅在档位真正变化时落盘，避免每轮都写文件。
+    const persistIfChanged = (changed) => {
+      if (changed && typeof this.adapter.persistIntervalState === 'function') {
+        this.adapter.persistIntervalState(mode);
+      }
+    };
+
+    if (!error) {
+      persistIfChanged(controller.recordSuccess());
+      return;
+    }
+
+    if (error.type === ErrorTypes.NO_QUALIFIED_PRODUCTS) {
+      // 请求本身是成功的，只是没有合适的挂单。
+      persistIfChanged(controller.recordSuccess());
+      return;
+    }
+
+    // EdgeOne / 405 拦截是明确的风控信号，需要大步退避。
+    // 注意：走 registerEdgeOneBlock 的熔断路径已在适配器内记过一次，此处
+    // 再记会造成双倍退避，因此只处理未触发熔断的 405（如下单接口直接失败）。
+    if (error.data?.edgeOneBlocked && Number(error.data.cooldownMs) > 0) {
+      return;
+    }
+    if (error.data?.edgeOneBlocked || error.code === 405) {
+      persistIfChanged(controller.recordBlocked());
+      return;
+    }
+
+    const retryableTypes = [
+      ErrorTypes.NETWORK_ERROR,
+      ErrorTypes.TIMEOUT_ERROR,
+      ErrorTypes.CONNECTION_ERROR,
+      ErrorTypes.API_ERROR,
+    ];
+    if (retryableTypes.includes(error.type)) {
+      persistIfChanged(controller.recordError());
+    }
+    // 其余（如支付米玛错误、库存不足）与请求频率无关，不调整间隔。
+  }
+
+  /**
    * Apply adapter- and mode-specific random jitter while preserving the
    * configured average interval.
    */
@@ -232,10 +299,17 @@ class PurchaseStrategy {
    * @returns {number} 间隔时间（毫秒）
    */
   getPlatformInterval(config) {
+    // 用户显式指定的间隔优先级最高，自适应不覆盖人工决定。
     const configuredInterval = Number(config.interval);
     if (Number.isFinite(configuredInterval) && configuredInterval > 0) {
       console.log(`[间隔配置] 📋 使用任务配置: ${this.adapter.platformName}.smart-buy.${this.getStrategyMode()} = ${configuredInterval}ms`);
       return configuredInterval;
+    }
+
+    // 其次用自适应控制器当前探到的值（按模式隔离）。
+    const controller = this.adapter?.getIntervalController?.(this.getStrategyMode());
+    if (controller) {
+      return controller.getInterval();
     }
 
     try {

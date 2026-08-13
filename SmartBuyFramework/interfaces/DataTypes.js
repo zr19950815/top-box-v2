@@ -45,6 +45,7 @@
  * @property {string} [name] - 商品名称（可选）
  * @property {number} price - 商品价格
  * @property {boolean} available - 是否可购买
+ * @property {number[]} [payTypes] - 商品支持的支付类型
  * @property {Object} [meta] - 平台特有数据（可选）
  */
 
@@ -70,7 +71,8 @@
  * @property {string} payPassword - 支付密码
  * @property {string} [mode] - 抢购模式 ('list'|'quick'|'batch')
  * @property {number} [batchSize] - 批量大小（批量模式）
- * @property {string} [combinationId] - 合成ID
+ * @property {string} [combinationId] - 合成ID或合成名称
+ * @property {string} [combinationName] - 合成名称（HC 自动匹配配方时使用）
  * @property {string} [resaleId] - 寄售ID
  */
 
