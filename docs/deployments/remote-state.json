@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "projectName": "top-box-v2",
-  "updatedAt": "2026-08-13T19:49:00+08:00",
+  "updatedAt": "2026-08-13T20:05:00+08:00",
   "deployed": true,
   "lastStatus": "success",
-  "summary": "QQ 私聊任务控制发布，含发布后增量修复：成交记录改上海时间并加表头、成交查询不发登录回执、失败通知上报真实原因、清理历史任务明文凭据",
+  "summary": "QQ 私聊任务控制：中文菜单、任务绑定发起人、任务管理指令（获取／停止）、幻藏上架、按名称取消、HC 自适应请求间隔（含跨进程并发分摊）",
   "deploymentPlanPath": "docs/deployments/deployment-plan.md",
   "deploymentPatternPath": "docs/deployments/deployment-pattern.md",
   "verifiedAt": "2026-08-13T19:49:00+08:00",
@@ -19,8 +19,8 @@
     "authMethod": "key"
   },
   "git": {
-    "branch": "main",
-    "commit": "3c73a92",
+    "branch": "feat/qq-task-control",
+    "commit": "dff59f4",
     "workingTreeDirty": true
   },
   "services": [
@@ -41,5 +41,7 @@
     "http://127.0.0.1:3001/api/health",
     "http://127.0.0.1:3001/api/status"
   ],
-  "knownIssues": []
+  "knownIssues": [
+    "platforms/hc/HcAdapter.js:585 硬编码验证码识别服务（ttshitu）默认密码。非平台账号凭据且 HEAD 中本就存在，建议改为只从 TTSHITU_PASSWORD 读取"
+  ]
 }

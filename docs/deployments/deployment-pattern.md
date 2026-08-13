@@ -78,3 +78,8 @@ OneBot 暴露到公网，届时 token 是唯一防线。
 **8. 只重启 Manager，不动 NapCat。**
 `pm2 restart smartbuy-manager --update-env` 即可；重启 NapCat 会丢失 QQ 登录态，
 需要重新扫码。
+
+**9. 不要同步 `SmartBuyFramework/config/intervals/.hc-*.json`。**
+它们是自适应调频的运行期状态（探到的安全间隔、活跃进程心跳），与出口 IP 相关。
+新 release 缺少这些文件是正常的——控制器会从起始值重新试探。误把本地文件同步上去
+会让线上沿用本地环境探到的值。已在 `.gitignore` 中排除。

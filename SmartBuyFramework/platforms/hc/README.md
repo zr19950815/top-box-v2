@@ -75,6 +75,48 @@ node cli.js "hc成交-手机号-米玛-NEWBEE门票"
   `attemptedCount`、`successCount`、`failureCount`、`aborted`、`abortedReason`
   以及逐件的 `results`。
 
+## 自适应请求间隔
+
+抢购任务的轮询间隔由 `core/AdaptiveIntervalController` 动态调整，配置见
+`config/intervals/hc.js` 的 `adaptive` 段。
+
+设计取向是**从已验证安全的间隔起步、小步提速，被拦截则大步退避**，而不是先撞墙
+再回退：EdgeOne 拦截的代价是分钟级冷却，期间完全无法抢单，远高于平时快几十毫秒
+的收益。因此退避（默认 4 档）比提速（1 档）果断。
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| 起始间隔 | list/quick 500ms，batch 800ms | 取 `base.<mode>` |
+| 区间 | list/quick 300–1000ms，batch 600–1500ms | batch 一次提交多单、请求更重，不与列表同频 |
+| 步长 | 50ms | |
+| 提速条件 | 连续 20 次无异常 | 从 500 探到 300 约需 80 次请求 |
+| 拦截退避 | 4 档（200ms） | 并记住该档不安全 |
+| 异常退避 | 1 档（50ms） | 网络类错误，不封死档位 |
+
+几个关键行为：
+
+- **`NO_QUALIFIED_PRODUCTS` 记为成功。** 市场上暂无符合价格的挂单是正常业务状态，
+  不是限流信号。抢购任务等挂单期间会持续产生它，若据此降速，任务会越等越慢。
+- **被拦截的档位会被记住**，提速时不再越过，避免反复撞同一面墙。但这道墙不是
+  永久的——`blockedRetryMs`（默认 30 分钟）后允许重新试探，因为平台限制随时段与
+  策略变化，放松了应当能受益。
+- **EdgeOne 熔断直接作为负反馈信号**，不另造检测。注意熔断路径内部已记录一次，
+  策略层用 `cooldownMs > 0` 区分，避免双倍退避。
+- **跨进程分摊总预算。** 购买任务各自是独立子进程（默认可并发 10 个），只看自己
+  的话会一起探到下限——各自都不被拦截，但平台侧合计流量早已超标，最终集体撞墙、
+  集体退避形成震荡。因此用 `.hc-active-procs.json` 登记进程心跳（30 秒 TTL），
+  把 `maxRequestsPerSecond`（默认 4）按活跃进程数分摊。
+
+探到的值按模式落盘到 `config/intervals/.hc-adaptive-<mode>.json`，避免每次重启
+都从头试探（每档需累积 20 次成功）。状态 1 小时过期。这些文件属运行期状态且与
+出口 IP 相关，已在 `.gitignore` 中排除。
+
+实际请求节奏比配置值慢：间隔从循环开始计时、包含请求自身耗时（200–400ms），
+list/quick 另叠加 ±1/9 抖动（固定频率最容易被识别）。
+
+关闭自适应：把 `adaptive.enabled` 设为 `false`，或构造适配器时传
+`adaptiveInterval: false`，策略层会退回静态配置。
+
 HC protects its API with Tencent EdgeOne and rejects the default Node.js TLS
 fingerprint. The adapter therefore uses an `impit` Chrome-compatible transport
 for the complete HC request chain by default. It honors `HTTPS_PROXY`,

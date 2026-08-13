@@ -82,6 +82,8 @@ const config = {
     // 群聊没有任何交互入口，因此也不存在群白名单。
     directCommandsEnabled: process.env.QQ_BOT_DIRECT_COMMANDS_ENABLED === 'true',
     privateTestReply: process.env.QQ_BOT_PRIVATE_TEST_REPLY || '',
+    // 「获取任务」给出的编号有效期。过期后需重新查询，避免用旧列表停到新任务。
+    taskSelectionTtlMs: Number(process.env.QQ_BOT_TASK_SELECTION_TTL_MS || 5 * 60 * 1000),
     reconnectInterval: Number(process.env.QQ_BOT_RECONNECT_INTERVAL_MS || 5000),
     actionTimeout: Number(process.env.QQ_BOT_ACTION_TIMEOUT_MS || 10000)
   },

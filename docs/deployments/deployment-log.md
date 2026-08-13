@@ -542,3 +542,33 @@ Known issues:
 - none
 
 Notes: 同一 release 20260813174244 原地更新，回滚目标仍为 20260813122348。触发原因：用户用错误米玛提交购买任务后只收到"任务失败：任务异常结束，请稍后重试"，易误判为程序故障。根因是 Manager 在子进程退出时把 error_message 填成"进程退出码: 1"，而真实原因（"message": "密码不正确"、"type": "LOGIN_FAILED"）只存在于子进程日志中，从未被采集。修复：TaskExecutor 新增 extractFailureReason()，从 stdout/stderr 识别序列化错误对象的 message/msg 字段及"登录认证失败: xxx"类带标签文案，保留最早出现的根因；进程失败时优先上报该原因，退出码仅兜底。QQBotBridge.describeFailure() 补充 密码不正确 / LOGIN_FAILED 匹配。关键约束是不能误伤正常进度日志——抢购任务等挂单期间持续输出"❌ 没有符合条件的商品"与"⚠️ 执行错误: NO_QUALIFIED_PRODUCTS"，若误判会把运行中的任务报成失败，已写断言守住。测试 Manager 80/80（远程同样 80/80）、Framework 68/68。本次重启完整验证了 A 方案重启善后：运行中的抢购任务标为 interrupted（区别于 failed）、task-interrupted 通知送达、子进程无残留、日志输出"已清理 1 个重启残留任务"。线上实测米玛错误现显示"任务失败：账号或米玛不正确"。NapCat 未重启（已持续 8 小时）。用户此前运行的福仔任务（上限 300）因重启中断，需重新提交。
+
+## 2026-08-13T20:05:00+08:00 - success
+
+- Summary: 新增 QQ 任务管理指令（获取任务／停止任务）与 HC 自适应请求间隔，含跨进程并发分摊
+- Remote: `root@124.221.245.146:22`
+- Remote project directory: `/www/wwwroot/top-box-v2`
+- Auth method: `key`
+- Git branch: `feat/qq-task-control`
+- Git commit: `dff59f4`
+- Working tree dirty: `True`
+- Deployment plan: `docs/deployments/deployment-plan.md`
+- Deployment pattern: `docs/deployments/deployment-pattern.md`
+- Verified at: `2026-08-13T20:05:00+08:00`
+- Verification status: `passed`
+
+Services:
+- smartbuy-manager
+
+Ports:
+- 3001
+- 3002
+
+Health URLs:
+- http://127.0.0.1:3001/api/health
+- http://127.0.0.1:3001/api/status
+
+Known issues:
+- platforms/hc/HcAdapter.js:585 硬编码验证码识别服务（ttshitu）默认密码 qwer1234。非平台账号凭据且 HEAD 中本就存在，建议改为只从 TTSHITU_PASSWORD 读取（不属本次范围）
+
+Notes: 同一 release 20260813174244 原地更新，回滚目标仍为 20260813122348。代码已提交到分支 feat/qq-task-control（commit dff59f4，47 文件 +6355 行），main 保持 3c73a92 作为回退点。新增任务管理：获取任务／停止任务-N／停止任务-全部，编号为列表临时序号（任务 ID 形如 task_1786616673616_hc_list_845ni 无法在手机输入），按编号停止须先查列表兼作防手滑确认，编号 5 分钟过期，仅能操作自己的任务。自适应调频：此前列表与快捷实际都跑 800ms，因 CommandParser 硬编码 interval: 800 使 config/intervals/hc.js 从未生效，清除后新增 AdaptiveIntervalController，起点 500ms、连续 20 次成功提速 50ms、被拦截退 4 档并记住不安全档位。Review 抓到三个实质缺陷并修复：(1) blockedInterval 原为永久墙，撞过一次就再回不去，与"平台放松应能受益"矛盾，加 blockedRetryMs 30 分钟后重探，blockedAt 一并落盘否则重启后墙永久有效；(2) batch 会被压到 300ms，批量下单请求更重不该与列表同频，改按模式隔离用 600-1500ms；(3) 并发进程集体误判——购买任务各自独立子进程仅看自己，会一起探到下限而平台侧合计流量超标，最终集体撞墙退避形成震荡，查历史确认并发是常态（31 对任务曾时间重叠），故用 .hc-active-procs.json 登记心跳（30 秒 TTL）按活跃进程数分摊 maxRequestsPerSecond=4，实测单进程 300ms、5 并发被压到 500-1000ms。状态按模式落盘、1 小时过期、临时文件+rename 写入，已加 gitignore（与出口 IP 相关，发布时不可同步）。文档核对：hc/README.md 中 12 项数值与代码逐一比对一致。测试 209 条（Framework 107、Manager 102）。未执行任何真实购买、合成、取消或上架。
