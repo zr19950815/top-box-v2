@@ -8,6 +8,7 @@ const EventEmitter = require('events');
 const database = require('../../database/Database');
 const TaskExecutor = require('./TaskExecutor');
 const config = require('../../config/config');
+const { sanitizeCommandString, redactSensitive } = require('../../utils/redact');
 
 class TaskManager extends EventEmitter {
   constructor() {
@@ -15,7 +16,12 @@ class TaskManager extends EventEmitter {
     this.tasks = new Map(); // 内存中的任务状态
     this.taskExecutor = new TaskExecutor();
     this.maxConcurrent = config.tasks.maxConcurrent;
-    this.runningTasks = 0;
+    // 并发占用以任务ID集合为准，而不是一个裸计数器。裸计数器会被多条收尾路径
+    // 重复减一（executeTask 失败时既 emit taskStatusChanged 又 throw；stopTask
+    // 自己减一后子进程退出又会 emit 'stopped'），最终变成负数，让
+    // getTaskStats().runningCount 失真——而部署门禁正是看这个数字。
+    this.runningTaskIds = new Set();
+    this.executionCommands = new Map();
     
     // 绑定事件监听
     this.taskExecutor.on('taskStatusChanged', this.handleTaskStatusChange.bind(this));
@@ -41,13 +47,14 @@ class TaskManager extends EventEmitter {
       // 构建任务对象
       const task = {
         id: taskId,
-        command_string: taskData.commandString,
+        command_string: this.sanitizeCommandString(taskData.commandString),
+        qq_user_id: taskData.qqUserId ? String(taskData.qqUserId) : null,
         platform: parsedCommand.platform,
         task_type: parsedCommand.taskType,
         mode: parsedCommand.mode,
         status: 'pending',
         priority: taskData.priority || 1,
-        config: JSON.stringify(parsedCommand.config),
+        config: JSON.stringify(this.sanitizeTaskConfig(parsedCommand.config)),
         progress: JSON.stringify({ completed: 0, total: parsedCommand.config.quantity || 1 }),
         error_message: null,
         created_at: new Date().toISOString(),
@@ -60,13 +67,15 @@ class TaskManager extends EventEmitter {
       await database.run(`
         INSERT INTO tasks (
           id, command_string, platform, task_type, mode, status, priority, 
-          config, progress, error_message, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          config, progress, error_message, created_at, updated_at, qq_user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         task.id, task.command_string, task.platform, task.task_type, task.mode,
         task.status, task.priority, task.config, task.progress, task.error_message,
-        task.created_at, task.updated_at
+        task.created_at, task.updated_at, task.qq_user_id
       ]);
+
+      this.executionCommands.set(taskId, taskData.commandString);
 
       // 保存到内存
       this.tasks.set(taskId, task);
@@ -77,7 +86,7 @@ class TaskManager extends EventEmitter {
       this.emit('taskCreated', task);
 
       // 自动启动任务（如果未达到并发限制）
-      if (this.runningTasks < this.maxConcurrent) {
+      if (this.runningTaskIds.size < this.maxConcurrent) {
         await this.startTask(taskId);
       }
 
@@ -103,8 +112,8 @@ class TaskManager extends EventEmitter {
         throw new Error(`任务状态不允许启动: ${task.status}`);
       }
 
-      if (this.runningTasks >= this.maxConcurrent) {
-        console.log(`⏳ 任务 ${taskId} 等待执行（当前并发: ${this.runningTasks}/${this.maxConcurrent}）`);
+      if (this.runningTaskIds.size >= this.maxConcurrent) {
+        console.log(`⏳ 任务 ${taskId} 等待执行（当前并发: ${this.runningTaskIds.size}/${this.maxConcurrent}）`);
         return;
       }
 
@@ -113,11 +122,13 @@ class TaskManager extends EventEmitter {
         started_at: new Date().toISOString()
       });
 
-      this.runningTasks++;
+      this.runningTaskIds.add(taskId);
       console.log(`🚀 启动任务: ${taskId} (${task.platform} ${task.mode}模式)`);
 
       // 异步执行任务
-      this.taskExecutor.executeTask(taskId, task.command_string)
+      const executionCommand = this.executionCommands.get(taskId);
+      if (!executionCommand) throw new Error('任务执行凭据已不可用，请重新提交任务');
+      this.taskExecutor.executeTask(taskId, executionCommand)
         .catch(error => {
           console.error(`❌ 任务执行失败: ${taskId}`, error);
           this.handleTaskError(taskId, error);
@@ -158,8 +169,8 @@ class TaskManager extends EventEmitter {
         completed_at: new Date().toISOString()
       });
 
-      this.runningTasks--;
-      
+      this.releaseSlot(taskId);
+
       // 尝试启动下一个等待的任务
       await this.startNextPendingTask();
 
@@ -289,7 +300,9 @@ class TaskManager extends EventEmitter {
         await this.stopTask(taskId);
       }
 
-      // 从数据库删除
+      // 从数据库删除。sqlite3 默认不开启外键约束，task_notifications 上的
+      // ON DELETE CASCADE 不会生效，这里显式清理去重记录。
+      await database.run('DELETE FROM task_notifications WHERE task_id = ?', [taskId]);
       await database.run('DELETE FROM tasks WHERE id = ?', [taskId]);
       
       // 从内存删除
@@ -323,7 +336,7 @@ class TaskManager extends EventEmitter {
         total: 0,
         byStatus: {},
         byPlatform: {},
-        runningCount: this.runningTasks,
+        runningCount: this.runningTaskIds.size,
         maxConcurrent: this.maxConcurrent
       };
 
@@ -354,15 +367,12 @@ class TaskManager extends EventEmitter {
    */
   async handleTaskStatusChange(taskId, status, data = {}) {
     try {
-      // 将 errorMessage 转换为 error_message
-    if (data.errorMessage) {
-      data.error_message = data.errorMessage;
-      delete data.errorMessage;
-    }
-    await this.updateTaskStatus(taskId, status, data);
+      // 字段名归一由 updateTaskStatus 统一处理。
+      await this.updateTaskStatus(taskId, status, data);
       
       if (status === 'completed' || status === 'failed' || status === 'stopped') {
-        this.runningTasks--;
+        this.executionCommands.delete(taskId);
+        this.releaseSlot(taskId);
         // 尝试启动下一个等待的任务
         await this.startNextPendingTask();
       }
@@ -410,7 +420,7 @@ class TaskManager extends EventEmitter {
       errorMessage: error.message,
       completedAt: new Date().toISOString()
     });
-    this.runningTasks--;
+    this.releaseSlot(taskId);
     await this.startNextPendingTask();
   }
 
@@ -423,7 +433,7 @@ class TaskManager extends EventEmitter {
       const updateFields = {
         status,
         updated_at: new Date().toISOString(),
-        ...additionalData
+        ...this.normalizeTaskFields(additionalData)
       };
 
       // 构建SQL更新语句
@@ -441,7 +451,8 @@ class TaskManager extends EventEmitter {
       }
 
       console.log(`📝 任务状态更新: ${taskId} -> ${status}`);
-      this.emit('taskStatusUpdated', { id: taskId, status, ...additionalData });
+      // 用归一后的字段广播，订阅方（如 QQ 通知）只需认识真实列名。
+      this.emit('taskStatusUpdated', { id: taskId, ...updateFields });
 
     } catch (error) {
       console.error(`❌ 更新任务状态失败: ${taskId}`, error);
@@ -450,11 +461,45 @@ class TaskManager extends EventEmitter {
   }
 
   /**
+   * 把调用方可能传入的 camelCase 字段名归一成真实列名，并丢弃未知字段。
+   *
+   * updateTaskStatus 直接用 key 拼 SQL 列名，一个 camelCase 键（如
+   * errorMessage）会让语句变成 "SET errorMessage = ?" 而直接抛
+   * SQLITE_ERROR；该异常沿 handleTaskError 冒泡成 unhandledRejection，
+   * 进而触发 process.exit —— 一个任务失败会连带杀掉整个 Manager。
+   * @private
+   */
+  normalizeTaskFields(data = {}) {
+    const columnAliases = {
+      errorMessage: 'error_message',
+      completedAt: 'completed_at',
+      startedAt: 'started_at',
+      updatedAt: 'updated_at',
+      qqUserId: 'qq_user_id'
+    };
+    const allowedColumns = new Set([
+      'status', 'error_message', 'completed_at', 'started_at',
+      'updated_at', 'progress', 'priority', 'qq_user_id'
+    ]);
+
+    const normalized = {};
+    for (const [key, value] of Object.entries(data)) {
+      const column = columnAliases[key] || key;
+      if (!allowedColumns.has(column)) {
+        console.warn(`⚠️ 忽略未知任务字段: ${key}`);
+        continue;
+      }
+      normalized[column] = value;
+    }
+    return normalized;
+  }
+
+  /**
    * 启动下一个等待中的任务
    * @private
    */
   async startNextPendingTask() {
-    if (this.runningTasks >= this.maxConcurrent) {
+    if (this.runningTaskIds.size >= this.maxConcurrent) {
       return;
     }
 
@@ -482,47 +527,105 @@ class TaskManager extends EventEmitter {
     // Use the framework parser as the single source of truth so Manager stays
     // aligned with every registered platform and token/password command form.
     const CommandParser = require(`${config.framework.path}/core/CommandParser`);
-    const parts = CommandParser.smartSplit(commandString);
-    if (parts.length < 2) {
-      throw new Error('命令格式错误');
-    }
-
-    const command = CommandParser.parseCommand(parts[0]);
-    const params = parts.slice(1);
-    const baseParams = CommandParser.parseBaseParams(params);
-    let taskParams = { ...baseParams };
-
-    if (command.task === 'smart-buy') {
-      const productSpecIndex = baseParams.authMode === 'token'
-        ? (baseParams.account ? 3 : 2)
-        : 3;
-      const productParts = String(params[productSpecIndex] || '').split('*');
-      if (productParts.length !== 3) {
-        throw new Error('商品参数格式应为 商品名称或ID*数量*最高价格');
-      }
-      const quantity = Number.parseInt(productParts[1], 10);
-      const maxPrice = Number.parseFloat(productParts[2]);
-      if (!productParts[0] || !Number.isInteger(quantity) || quantity <= 0 || maxPrice <= 0) {
-        throw new Error('商品名称、数量或最高价格无效');
-      }
-      taskParams = {
-        ...baseParams,
-        productId: productParts[0],
-        quantity,
-        maxPrice,
-      };
-    }
+    const parsedCommand = CommandParser.parse(commandString);
+    const taskParams = parsedCommand.params;
 
     return {
-      platform: command.platform,
-      mode: command.mode || null,
-      taskType: command.task,
+      platform: parsedCommand.platform,
+      mode: parsedCommand.mode || null,
+      taskType: parsedCommand.task,
       config: {
         ...taskParams,
         // Keep the old Manager field for callers that still display `auth`.
         auth: taskParams.token || taskParams.password,
       }
     };
+  }
+
+  sanitizeCommandString(commandString) {
+    return sanitizeCommandString(commandString);
+  }
+
+  sanitizeTaskConfig(taskConfig = {}) {
+    const safe = { ...taskConfig };
+    for (const key of ['password', 'payPassword', 'token', 'auth']) delete safe[key];
+    if (safe.account) safe.account = this.maskAccount(safe.account);
+    return safe;
+  }
+
+  maskAccount(account) {
+    const value = String(account || '');
+    return value.length >= 7 ? `${value.slice(0, 3)}****${value.slice(-4)}` : '***';
+  }
+
+  /**
+   * 启动时清理上一个进程残留的任务。
+   *
+   * 执行凭据（含米玛）只存在内存里，从不落盘，因此进程一旦退出，running /
+   * pending 的任务就无法恢复执行。若放着不动，DB 里会永久挂着 running 的僵尸
+   * 任务，并发计数与真实状态也会脱节。这里统一标成 interrupted 并返回需要通
+   * 知的任务，由调用方在 QQ 连接就绪后告知发起人重新提交。
+   *
+   * @returns {Promise<Array<{id: string, qq_user_id: string}>>} 需通知的任务
+   */
+  async recoverInterruptedTasks() {
+    const stale = await database.query(
+      "SELECT id, qq_user_id, task_type FROM tasks WHERE status IN ('running', 'pending')"
+    );
+
+    if (stale.length) {
+      const now = new Date().toISOString();
+      await database.run(
+        `UPDATE tasks SET status = 'interrupted', error_message = ?, completed_at = ?, updated_at = ?
+         WHERE status IN ('running', 'pending')`,
+        ['服务重启，任务已中断', now, now]
+      );
+      console.log(`🧹 已清理 ${stale.length} 个重启残留任务`);
+    }
+
+    // 内存态一律以“空”为起点，避免沿用上一个进程的残留计数。
+    this.tasks.clear();
+    this.runningTaskIds.clear();
+    this.executionCommands.clear();
+
+    return stale.filter((task) => task.qq_user_id);
+  }
+
+  /**
+   * 释放并发槽位。多条收尾路径可能对同一任务重复调用（进程退出事件、
+   * executeTask 的 reject、手动 stopTask），用集合删除保证幂等。
+   * @private
+   */
+  releaseSlot(taskId) {
+    this.runningTaskIds.delete(taskId);
+  }
+
+  async reserveNotification(taskId, eventKey) {
+    const result = await database.run(
+      'INSERT OR IGNORE INTO task_notifications (task_id, event_key) VALUES (?, ?)',
+      [taskId, eventKey]
+    );
+    return result.changes === 1;
+  }
+
+  async getOwnedTask(taskId, qqUserId) {
+    return database.queryOne('SELECT * FROM tasks WHERE id = ? AND qq_user_id = ?', [taskId, String(qqUserId)]);
+  }
+
+  /**
+   * 列出某个 QQ 正在运行的任务，按创建时间正序（与用户提交顺序一致）。
+   *
+   * 只查该 QQ 自己的任务：任务归属在创建时就绑定，不能让人看到或停掉别人的。
+   * @param {string} qqUserId - 发起人 QQ 号
+   * @returns {Promise<Array>} 运行中的任务
+   */
+  async getRunningTasksByOwner(qqUserId) {
+    return database.query(
+      `SELECT * FROM tasks
+       WHERE qq_user_id = ? AND status = 'running'
+       ORDER BY created_at ASC`,
+      [String(qqUserId)]
+    );
   }
 
   /**

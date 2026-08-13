@@ -14,6 +14,7 @@ const path = require('path');
 const PlatformAdapter = require('../../interfaces/PlatformAdapter');
 const { ErrorFactory, ErrorTypes } = require('../../utils/ErrorTypes');
 const Logger = require('../../utils/Logger');
+const AdaptiveIntervalController = require('../../core/AdaptiveIntervalController');
 
 class HcAdapter extends PlatformAdapter {
   constructor(authValue, config = {}) {
@@ -21,7 +22,11 @@ class HcAdapter extends PlatformAdapter {
 
     this.platformName = 'hc';
     this.platformVersion = '0.1.0';
-    this.supportedPayType = 8;
+    // HC market listings use the payment-channel IDs exposed by the API:
+    // 140 is Huifu (汇付), while 121 is Yibao (易宝). Keep the selector
+    // configurable for future channel changes, but default to Huifu because
+    // the payment submission flow below also uses pay_type 140.
+    this.supportedPayType = Number(config.supportedPayType ?? 140);
 
     this.apiBaseURL = config.apiBaseURL || 'https://api.newbee.net.cn';
     this.payBaseURL = config.payBaseURL || 'https://pay.huancang.art';
@@ -49,6 +54,10 @@ class HcAdapter extends PlatformAdapter {
     ).map(Number).filter((value) => Number.isFinite(value) && value >= 0);
     this.edgeOneBlockCount = 0;
     this.edgeOneBlockedUntil = 0;
+    this.adaptiveIntervalConfig = config;
+    // 按模式各自持有控制器：list/quick/batch 的合理频率不同，共用一个会把
+    // 批量下单压到与列表同样的频率。
+    this.intervalControllers = new Map();
     this.sleep = config.sleep || ((milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.listPageIntervalMs = Number(config.listPageIntervalMs || 450);
@@ -66,6 +75,175 @@ class HcAdapter extends PlatformAdapter {
       }),
       validateStatus: () => true,
     });
+  }
+
+  /**
+   * 创建自适应间隔控制器。配置见 config/intervals/hc.js 的 `adaptive` 段；
+   * 关闭该开关或传入 `adaptiveInterval: false` 时返回 null，策略层随即退回
+   * 静态配置。
+   *
+   * 会尝试恢复上次探到的安全间隔，避免每个进程都从起点重新试探（每档需累积
+   * 20 次成功，从头摸一遍要上百次请求）。状态设有效期，过期后重新试探。
+   * @private
+   */
+  getIntervalController(mode = 'list') {
+    if (this.intervalControllers.has(mode)) {
+      return this.intervalControllers.get(mode);
+    }
+    const controller = this.createIntervalController(mode, this.adaptiveIntervalConfig || {});
+    this.intervalControllers.set(mode, controller);
+    return controller;
+  }
+
+  createIntervalController(mode, config = {}) {
+    if (config.adaptiveInterval === false) return null;
+
+    let intervalConfig;
+    try {
+      intervalConfig = require('../../config/intervals/hc');
+    } catch (_) {
+      return null;
+    }
+
+    const adaptive = intervalConfig?.adaptive;
+    if (!adaptive?.enabled) return null;
+
+    // 模式级覆盖优先于全局区间。
+    const modeOverrides = adaptive.modes?.[mode] || {};
+    const settings = { ...adaptive, ...modeOverrides };
+
+    const controller = new AdaptiveIntervalController({
+      baseInterval: intervalConfig.base?.[mode] ?? intervalConfig.base?.list ?? 500,
+      minInterval: settings.minInterval,
+      maxInterval: settings.maxInterval,
+      step: settings.step,
+      successThreshold: settings.successThreshold,
+      blockBackoffSteps: settings.blockBackoffSteps,
+      errorBackoffSteps: settings.errorBackoffSteps,
+      blockedRetryMs: settings.blockedRetryMs,
+      onAdjust: (message) => Logger.info(`[HC:${mode}] ${message}`),
+      ...(config.adaptiveIntervalOptions || {}),
+    });
+
+    this.intervalStateTtlMs = Number(adaptive.stateTtlMs || 0);
+    const statePath = this.getIntervalStatePath(mode, config);
+
+    try {
+      if (statePath && fs.existsSync(statePath)) {
+        const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        controller.restoreState(saved, this.intervalStateTtlMs);
+      }
+    } catch (error) {
+      Logger.warn(`[HC] 自适应间隔状态读取失败，从起始值试探: ${error.message}`);
+    }
+
+    return controller;
+  }
+
+  /**
+   * 状态文件按模式分开。购买任务各自是独立进程且可并发（默认上限 10），
+   * 共用一个文件会互相覆盖。
+   * @private
+   */
+  getIntervalStatePath(mode, config = {}) {
+    if (config.intervalStatePath === false) return null;
+    if (config.intervalStatePath) return config.intervalStatePath;
+    return path.resolve(
+      __dirname, `../../config/intervals/.hc-adaptive-${mode}.json`
+    );
+  }
+
+  /**
+   * 登记本进程为活跃，并按当前活跃进程数收紧各控制器的下限。
+   *
+   * 每个购买任务都是独立子进程，各自只能看到自己的请求。若都按单进程预算去探，
+   * 各自都不会被拦截，但平台侧看到的是合计流量——最终一起撞墙、一起退避，
+   * 形成震荡。这里用一个共享文件登记心跳，把总预算分摊到每个活跃进程。
+   *
+   * 失败一律忽略：它只是优化项，绝不能影响任务执行。
+   * @private
+   */
+  syncSharedInterval() {
+    const adaptive = this.getAdaptiveConfig();
+    const budget = Number(adaptive?.maxRequestsPerSecond);
+    if (!Number.isFinite(budget) || budget <= 0) return;
+
+    const registryPath = this.getIntervalRegistryPath();
+    if (!registryPath) return;
+
+    const ttl = Number(adaptive.activeProcessTtlMs || 30 * 1000);
+    const now = Date.now();
+
+    try {
+      let registry = {};
+      if (fs.existsSync(registryPath)) {
+        try {
+          registry = JSON.parse(fs.readFileSync(registryPath, 'utf8')) || {};
+        } catch (_) {
+          registry = {};
+        }
+      }
+
+      // 心跳续期，并清掉已过期（进程已退出或卡死）的登记。
+      registry[String(process.pid)] = now;
+      for (const [pid, seenAt] of Object.entries(registry)) {
+        if (now - Number(seenAt) > ttl) delete registry[pid];
+      }
+
+      const tempPath = `${registryPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tempPath, JSON.stringify(registry));
+      fs.renameSync(tempPath, registryPath);
+
+      const activeCount = Math.max(1, Object.keys(registry).length);
+      // 总预算按活跃进程数均分，换算成每个进程的最快间隔。
+      const sharedMin = Math.ceil(1000 / (budget / activeCount));
+
+      for (const [mode, controller] of this.intervalControllers) {
+        if (controller?.setSharedMinInterval(sharedMin)) {
+          this.persistIntervalState(mode);
+        }
+      }
+    } catch (error) {
+      Logger.warn(`[HC] 并发间隔同步失败: ${error.message}`);
+    }
+  }
+
+  /** @private */
+  getAdaptiveConfig() {
+    try {
+      return require('../../config/intervals/hc')?.adaptive;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** @private */
+  getIntervalRegistryPath() {
+    const config = this.adaptiveIntervalConfig || {};
+    if (config.intervalStatePath === false) return null;
+    if (config.intervalRegistryPath) return config.intervalRegistryPath;
+    return path.resolve(__dirname, '../../config/intervals/.hc-active-procs.json');
+  }
+
+  /**
+   * 把当前探到的间隔落盘。写入失败只记警告——它只是优化项，绝不能影响任务。
+   *
+   * 并发进程可能同时写入：先写临时文件再 rename，保证读到的永远是完整 JSON
+   * 而不是写一半的内容。
+   * @private
+   */
+  persistIntervalState(mode = 'list') {
+    const controller = this.intervalControllers.get(mode);
+    const statePath = this.getIntervalStatePath(mode, this.adaptiveIntervalConfig || {});
+    if (!controller || !statePath) return;
+
+    try {
+      const tempPath = `${statePath}.${process.pid}.tmp`;
+      fs.writeFileSync(tempPath, `${JSON.stringify(controller.toState(), null, 2)}\n`);
+      fs.renameSync(tempPath, statePath);
+    } catch (error) {
+      Logger.warn(`[HC] 自适应间隔状态写入失败: ${error.message}`);
+    }
   }
 
   async getBrowserTransport() {
@@ -226,6 +404,15 @@ class HcAdapter extends PlatformAdapter {
     const cooldownMs = schedule[Math.min(this.edgeOneBlockCount, schedule.length - 1)];
     this.edgeOneBlockCount += 1;
     this.edgeOneBlockedUntil = Date.now() + cooldownMs;
+
+    // 熔断本身就是最可靠的风控信号，直接作为自适应的负反馈，不另造检测。
+    // 拦截是账号/IP 级的，与具体模式无关，因此通知所有已激活的控制器。
+    for (const [mode, controller] of this.intervalControllers) {
+      if (controller?.recordBlocked()) {
+        // 被拦截的档位值得立刻记住，避免重启后又去撞同一面墙。
+        this.persistIntervalState(mode);
+      }
+    }
 
     Logger.warn(
       `[HC] EdgeOne 安全拦截，暂停请求 ${Math.ceil(cooldownMs / 60000)} 分钟`
@@ -1230,6 +1417,27 @@ class HcAdapter extends PlatformAdapter {
    * @param {Object} [options]
    * @param {number} [options.limit=50] 返回条数，上限 50
    */
+  /**
+   * 把秒级时间戳格式化成上海时间 `YYYY-MM-DD HH:mm:ss`。
+   *
+   * 平台返回的是 Unix 秒，直接 toISOString() 会得到 UTC，比本地时间早 8 小时，
+   * 用户读起来对不上。这里固定按 Asia/Shanghai 呈现，不依赖服务器时区设置。
+   * @param {number|string} seconds - Unix 秒级时间戳
+   * @returns {string|null}
+   */
+  formatShanghaiTime(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value)) return null;
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date(value * 1000));
+    const get = (type) => parts.find((part) => part.type === type)?.value || '';
+    return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+  }
+
   async getRecentTrades(productId, options = {}) {
     const resolvedProductId = await this.resolveProductId(
       productId,
@@ -1255,9 +1463,11 @@ class HcAdapter extends PlatformAdapter {
         serialNumber: trade.no == null ? null : String(trade.no),
         price: Number(trade.price),
         timestamp: Number(trade.time),
+        // 机器可读的 UTC 时间保留给调用方，另外提供上海本地时间用于展示。
         time: Number.isFinite(Number(trade.time))
           ? new Date(Number(trade.time) * 1000).toISOString()
           : null,
+        localTime: this.formatShanghaiTime(trade.time),
       })).filter((trade) => Number.isFinite(trade.price)),
     };
   }
@@ -1537,17 +1747,190 @@ class HcAdapter extends PlatformAdapter {
   }
 
   async cancelResale(resaleId) {
+    const resolvedProductId = await this.resolveProductId(resaleId);
     const data = await this.request(
       'post',
       `${this.apiBaseURL}/api/user_collect/batchCancelSale`,
       {
-        product_id: resaleId,
+        product_id: resolvedProductId,
         timestamp: Date.now(),
       }
     );
 
     this.ensureSuccess(data, '取消寄售失败', ErrorTypes.REQUEST_FAILED);
     return true;
+  }
+
+  async getListableCollectibles(productId, options = {}) {
+    const resolvedProductId = await this.resolveProductId(productId, options.productConfig);
+    const collectibles = [];
+    const maxPages = Math.max(1, Number(options.maxPages || 100));
+    for (let page = 1; page <= maxPages; page++) {
+      const data = await this.request('get', `${this.apiBaseURL}/api/user_collect`, {
+        product_id: resolvedProductId,
+        page,
+        per_page: 50,
+        product_type: 'virtual',
+        type: 'own_valid',
+        timestamp: Date.now(),
+      });
+      this.ensureSuccess(data, '获取可上架库存失败');
+      const payload = data.data || {};
+      const rows = Array.isArray(payload.data) ? payload.data : [];
+      // status === '2' 表示持有中且可上架（已寄售或锁定的资产状态不同）。
+      collectibles.push(...rows.filter((row) => String(row?.status) === '2').map((row) => ({
+        cid: String(row.id),
+        item_id: String(row.item_id),
+        product_id: String(row.product_id || resolvedProductId),
+        sn: String(row.item?.sn ?? ''),
+      })).filter((row) => row.cid && row.item_id && row.sn));
+
+      // has_more 并非所有分页接口都返回（目录接口就只给 current_page/
+      // last_page）。缺字段时退回页码比较，否则库存超过 50 个只会看到第一页。
+      const hasMore = Boolean(payload.has_more) || (
+        Number(payload.current_page || page) < Number(payload.last_page || page)
+      );
+      if (!hasMore) break;
+    }
+    return { productId: String(resolvedProductId), collectibles };
+  }
+
+  /**
+   * 判定上架失败该如何收尾。
+   *
+   * 上架要带支付米玛，对错误盲目重试的代价很高：米玛错误连撞数次可能触发平台
+   * 锁定或风控。ensureSuccess 把业务失败统一标成 REQUEST_FAILED，而该类型既
+   * 不在 isRetryable() 也不在 isFatal() 名单内，因此这里必须按类型 + 文案二次
+   * 判定，且默认不重试。
+   *
+   * @param {Error} error - 上架单个资产时抛出的错误
+   * @returns {'abort'|'retry'|'skip'} abort 整批中止 / retry 有限重试 / skip 跳过该资产
+   * @private
+   */
+  classifyListingError(error) {
+    const fatalTypes = [
+      ErrorTypes.PAYMENT_FAILED,
+      ErrorTypes.INSUFFICIENT_BALANCE,
+      ErrorTypes.UNAUTHORIZED,
+      ErrorTypes.TOKEN_EXPIRED,
+      ErrorTypes.TOKEN_INVALID,
+      ErrorTypes.LOGIN_FAILED,
+      ErrorTypes.VALIDATION_ERROR,
+      ErrorTypes.CONFIG_ERROR,
+    ];
+    const retryableTypes = [
+      ErrorTypes.NETWORK_ERROR,
+      ErrorTypes.TIMEOUT_ERROR,
+      ErrorTypes.CONNECTION_ERROR,
+    ];
+
+    const message = String(error?.message || '');
+    // 米玛错误、风控与账号状态问题：继续尝试只会放大风险，立刻整批停下。
+    if (/米玛|密码|password|风控|拦截|冻结|封禁|限制|安全策略|实名/i.test(message)) {
+      return 'abort';
+    }
+    if (fatalTypes.includes(error?.type)) return 'abort';
+    if (retryableTypes.includes(error?.type)) return 'retry';
+    if (/超时|timeout|ETIMEDOUT|ECONNRESET|socket hang up|网络/i.test(message)) {
+      return 'retry';
+    }
+    // 其余是这一件资产自身的问题（已寄售、状态变更等），跳过它继续下一件。
+    return 'skip';
+  }
+
+  async listCollectible(collectible, amount, payPassword) {
+    const data = await this.request('post', `${this.apiBaseURL}/api/user_collect/onSaleNew`, {
+      ...collectible,
+      amount,
+      pay_password: payPassword,
+      paytypes: '140',
+      timestamp: Date.now(),
+    });
+    this.ensureSuccess(data, '上架失败', ErrorTypes.REQUEST_FAILED);
+    return true;
+  }
+
+  /**
+   * 按指定数量批量上架。
+   *
+   * 库存不足时不报错，改为“有几个上几个”；调用方通过 requestedCount 与
+   * availableCount 的差值判断是否只完成了一部分。重试是有限的，且按错误类型
+   * 分流：米玛错误与风控立即整批中止，只有网络类错误才重试。
+   *
+   * @param {Object} options
+   * @param {string} options.productId - 藏品名称或 ID
+   * @param {number} options.quantity - 期望上架数量
+   * @param {number} options.amount - 挂单单价
+   * @param {string} options.payPassword - 支付米玛
+   * @returns {Promise<Object>} 结构化结果，便于生成通知
+   */
+  async listCollectibles(options = {}) {
+    const quantity = Number(options.quantity);
+    const amount = Number(options.amount);
+    if (!Number.isInteger(quantity) || quantity <= 0) throw ErrorFactory.createValidationError('上架数量必须为正整数');
+    if (!Number.isFinite(amount) || amount <= 0) throw ErrorFactory.createValidationError('上架价格必须大于 0');
+    if (!options.payPassword) throw ErrorFactory.createValidationError('缺少支付米玛');
+
+    const inventory = await this.getListableCollectibles(options.productId, options);
+    const availableCount = inventory.collectibles.length;
+    // 库存不足不再整批失败：能上多少就上多少。
+    const selected = inventory.collectibles.slice(0, quantity);
+    const maxAttempts = Math.max(1, Number(options.maxAttempts || 3));
+    const intervalMs = Math.max(0, Number(options.intervalMs ?? 2400));
+
+    const results = [];
+    let abortedReason = null;
+
+    for (let index = 0; index < selected.length; index++) {
+      const collectible = selected[index];
+      let lastError = null;
+      let attempts = 0;
+
+      for (attempts = 1; attempts <= maxAttempts; attempts++) {
+        try {
+          await this.listCollectible(collectible, amount, options.payPassword);
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          const decision = this.classifyListingError(error);
+
+          if (decision === 'abort') {
+            abortedReason = error.message;
+            break;
+          }
+          if (decision !== 'retry' || attempts >= maxAttempts) break;
+          await this.sleep(intervalMs);
+        }
+      }
+
+      results.push({
+        cid: collectible.cid,
+        success: !lastError,
+        attempts,
+        error: lastError?.message || null,
+      });
+
+      // 米玛错误或风控：继续只会放大风险，剩余资产不再尝试。
+      if (abortedReason) {
+        Logger.warn(`[HC] 上架中止：${abortedReason}`);
+        break;
+      }
+      if (index < selected.length - 1) await this.sleep(intervalMs);
+    }
+
+    const successCount = results.filter((item) => item.success).length;
+    return {
+      productId: inventory.productId,
+      requestedCount: quantity,
+      availableCount,
+      attemptedCount: results.length,
+      successCount,
+      failureCount: results.length - successCount,
+      aborted: Boolean(abortedReason),
+      abortedReason,
+      results,
+    };
   }
 }
 

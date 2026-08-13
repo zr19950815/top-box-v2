@@ -33,6 +33,20 @@ class Database {
     });
   }
 
+  async ensureTaskOwnershipSchema() {
+    const columns = await this.query('PRAGMA table_info(tasks)');
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has('qq_user_id')) await this.run('ALTER TABLE tasks ADD COLUMN qq_user_id TEXT');
+    await this.run(`CREATE TABLE IF NOT EXISTS task_notifications (
+      task_id TEXT NOT NULL,
+      event_key TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (task_id, event_key),
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    )`);
+    await this.run('CREATE INDEX IF NOT EXISTS idx_tasks_qq_user_id ON tasks(qq_user_id)');
+  }
+
   /**
    * 关闭数据库连接
    */
@@ -41,15 +55,21 @@ class Database {
       return;
     }
 
+    // Mark the connection as closing before the async callback so concurrent
+    // shutdown paths cannot close the same sqlite handle twice.
+    const db = this.db;
+    this.isConnected = false;
+    this.db = null;
+
     return new Promise((resolve, reject) => {
-      this.db.close((err) => {
+      db.close((err) => {
         if (err) {
+          this.isConnected = true;
+          this.db = db;
           console.error('❌ 关闭数据库失败:', err.message);
           reject(err);
         } else {
           console.log('✅ 数据库连接已关闭');
-          this.isConnected = false;
-          this.db = null;
           resolve();
         }
       });
@@ -222,18 +242,5 @@ class Database {
 
 // 创建单例实例
 const database = new Database();
-
-// 优雅关闭处理
-process.on('SIGINT', async () => {
-  console.log('\n🛑 收到关闭信号，正在关闭数据库连接...');
-  await database.close();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('\n🛑 收到终止信号，正在关闭数据库连接...');
-  await database.close();
-  process.exit(0);
-});
 
 module.exports = database;

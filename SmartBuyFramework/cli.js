@@ -20,7 +20,15 @@ class CLI {
    */
   parseArgs() {
     const args = process.argv.slice(2);
-    
+
+    // 指令含登录米玛与支付米玛。走 argv 时会落在 /proc/<pid>/cmdline，该文件对
+    // 所有用户可读（ps aux 就能看到明文）；因此 Manager 通过 TOPBOX_COMMAND
+    // 环境变量下发，仅同 UID 与 root 可读。argv 保留给本地调试。
+    const envCommand = process.env.TOPBOX_COMMAND;
+    if (envCommand && envCommand.trim() && args.length === 0) {
+      return { action: 'command', command: envCommand.trim() };
+    }
+
     if (args.length === 0) {
       return { action: 'help' };
     }
@@ -140,6 +148,7 @@ ${CommandParser.getHelp()}
       const result = await this.framework.executeCommand(command);
 
       console.log('✅ 命令执行成功!');
+      console.log(`TOPBOX_RESULT:${JSON.stringify(result ?? true)}`);
       
       // 如果有结果，显示摘要
       if (result && typeof result === 'object') {

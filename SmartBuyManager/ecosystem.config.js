@@ -7,8 +7,10 @@ module.exports = {
     {
       name: 'smartbuy-manager',
       script: 'backend/server.js',
-      instances: 2,
-      exec_mode: 'cluster',
+      // A single QQ event must be consumed once. Multiple cluster workers
+      // would each connect to OneBot and duplicate replies/tasks.
+      instances: 1,
+      exec_mode: 'fork',
       
       // 环境变量
       env: {

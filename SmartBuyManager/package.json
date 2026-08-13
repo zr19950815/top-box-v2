@@ -15,11 +15,16 @@
     "restart": "pm2 restart ecosystem.config.js",
     "test": "jest",
     "db:init": "node backend/database/init.js",
-    "db:migrate": "node backend/database/migrate.js"
+    "db:migrate": "node backend/database/migrate.js",
+    "qq:up": "docker compose --env-file .env -f docker-compose.qq-bot.yml up -d",
+    "qq:stop": "docker compose --env-file .env -f docker-compose.qq-bot.yml stop",
+    "qq:down": "docker compose --env-file .env -f docker-compose.qq-bot.yml down",
+    "qq:logs": "docker compose --env-file .env -f docker-compose.qq-bot.yml logs -f napcat"
   },
   "dependencies": {
     "chokidar": "^3.5.3",
     "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
@@ -29,7 +34,8 @@
     "sqlite3": "^5.1.6",
     "uuid": "^9.0.1",
     "winston": "^3.11.0",
-    "winston-daily-rotate-file": "^4.7.1"
+    "winston-daily-rotate-file": "^4.7.1",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^20.10.5",

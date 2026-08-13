@@ -11,6 +11,9 @@ logs/
 *.log
 *.pid
 storage/
+# 自适应间隔的运行期状态（探到的安全值、活跃进程心跳）。与出口 IP 相关，不入库。
+SmartBuyFramework/config/intervals/.hc-adaptive-*.json
+SmartBuyFramework/config/intervals/.hc-active-procs.json
 SmartBuyManager/storage/
 *.db
 *.sqlite

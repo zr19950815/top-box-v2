@@ -81,6 +81,7 @@ class DatabaseInitializer {
           started_at DATETIME,
           completed_at DATETIME,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          ,qq_user_id TEXT
         )`,
 
         // 日志表
@@ -125,6 +126,13 @@ class DatabaseInitializer {
           value TEXT NOT NULL,
           description TEXT,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`,
+        `CREATE TABLE IF NOT EXISTS task_notifications (
+          task_id TEXT NOT NULL,
+          event_key TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (task_id, event_key),
+          FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
         )`
       ];
 
@@ -160,6 +168,7 @@ class DatabaseInitializer {
         'CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)',
         'CREATE INDEX IF NOT EXISTS idx_tasks_platform ON tasks(platform)',
         'CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_tasks_qq_user_id ON tasks(qq_user_id)',
         'CREATE INDEX IF NOT EXISTS idx_logs_task_id ON logs(task_id)',
         'CREATE INDEX IF NOT EXISTS idx_logs_category ON logs(category)',
         'CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)',

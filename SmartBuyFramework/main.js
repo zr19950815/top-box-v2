@@ -110,7 +110,7 @@ class SmartBuyFramework {
     }
 
     try {
-      console.log(`🎯 开始执行命令: ${commandString}`);
+      console.log(`🎯 开始执行命令: ${String(commandString).split('-')[0]}`);
       
       // 1. 解析命令
       const parseResult = CommandParser.parse(commandString);

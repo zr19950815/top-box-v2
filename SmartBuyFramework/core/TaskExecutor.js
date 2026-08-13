@@ -103,9 +103,17 @@ class TaskExecutor {
         case 'combination':
           result = await this.executeCombination(config);
           break;
+
+        case 'trade-history':
+          result = await this.executeTradeHistory(config);
+          break;
           
         case 'cancel-resale':
           result = await this.executeCancelResale(config);
+          break;
+
+        case 'listing':
+          result = await this.executeListing(config);
           break;
           
         default:
@@ -191,7 +199,7 @@ class TaskExecutor {
    * @returns {Promise<boolean>} 是否成功
    */
   async executeCombination(config) {
-    console.log(`[任务执行器] 🔗 执行合成确认任务 - 合成ID: ${config.combinationId}`);
+    console.log(`[任务执行器] 🔗 执行合成确认任务 - 合成: ${config.combinationName || config.combinationId}`);
     
     if (!config.combinationId) {
       throw new Error('Missing combinationId for combination task');
@@ -244,6 +252,24 @@ class TaskExecutor {
   }
 
   /**
+   * 查询某个藏品最近成交记录（只读）。
+   * @private
+   */
+  async executeTradeHistory(config) {
+    if (!config.productId) {
+      throw new Error('Missing productId for trade-history task');
+    }
+
+    // 复用 authenticate()：它会输出“✅ 登录认证成功”，QQ 侧据此发送登录回执。
+    // 此前这里自写了一份不打印日志的登录逻辑，导致查询类任务收不到回执。
+    await this.authenticate(config);
+
+    const result = await this.adapter.getRecentTrades(config.productId);
+    console.log(`[任务执行器] 📈 查询到 ${result.trades.length} 笔最近成交`);
+    return result;
+  }
+
+  /**
    * 执行取消寄售任务
    * @private
    * @param {TaskConfig} config - 任务配置
@@ -291,7 +317,7 @@ class TaskExecutor {
     }
     
     // 调用平台适配器的取消寄售方法
-    const result = await this.adapter.cancelResale(config.resaleId);
+    const result = await this.adapter.cancelResale(config.productId || config.resaleId);
     
     if (result) {
       console.log(`[任务执行器] ✅ 取消寄售成功`);
@@ -300,6 +326,35 @@ class TaskExecutor {
     }
     
     return result;
+  }
+
+  async executeListing(config) {
+    await this.authenticate(config);
+    const result = await this.adapter.listCollectibles({
+      productId: config.productId,
+      productConfig: config.productConfig,
+      quantity: config.quantity,
+      amount: config.amount,
+      payPassword: config.payPassword,
+    });
+    console.log(
+      `[任务执行器] ✅ 上架完成: 成功 ${result.successCount}，失败 ${result.failureCount}` +
+      `（请求 ${result.requestedCount}，可上架 ${result.availableCount}` +
+      `${result.aborted ? '，已提前中止' : ''}）`
+    );
+    return result;
+  }
+
+  async authenticate(config) {
+    if (config.authMode === 'token' && config.token) {
+      if (!await this.adapter.validateToken(config.token)) throw new Error('Token验证失败，可能已过期');
+      console.log('[任务执行器] ✅ 登录认证成功');
+      return;
+    }
+    if (!config.account || !config.password) throw new Error('缺少登录凭据');
+    const result = await this.adapter.login({ account: config.account, password: config.password });
+    if (!result.success) throw new Error('登录认证失败');
+    console.log('[任务执行器] ✅ 登录认证成功');
   }
 
   /**
